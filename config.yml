@@ -1,0 +1,342 @@
+# INDRA LLM Configuration
+# Vedic-aligned Decoder-only Transformer LLM
+# (c) Divyansh Bharadwaj
+
+model:
+  # Base architecture
+  vocab_size: 262154 # Larger for Sanskrit support ## <============= ORignal: 75000
+  n_positions: 2048
+  n_embd: 768
+  n_layer: 12
+  n_head: 12
+  n_kv_head: 4  # For Grouped Query Attention
+  intermediate_size: 3072
+  
+  # Activation and normalization
+  activation_function: "gelu"
+  layer_norm_eps: 1e-5
+  use_rms_norm: true
+  
+  # Efficiency features
+  use_flash_attention: true
+  use_kv_cache: true
+  gradient_checkpointing: false
+  
+  # Rope settings
+  use_rope: true
+  rope_theta: 10000.0
+  
+  # Dropout
+  dropout: 0.0
+  attention_dropout: 0.0
+  residual_dropout: 0.0
+  
+  # Initialization
+  initializer_range: 0.02
+
+# Mixture of Experts configuration
+moe:
+  use_moe: true
+  num_experts: 8
+  expert_capacity: 2
+  top_k: 2
+  jitter_noise: 0.1
+  auxiliary_loss_weight: 0.01
+
+# Grouped Query Attention configuration
+gqa:
+  num_heads: 12
+  num_kv_heads: 4
+  head_dim: 64
+  group_size: 3
+
+# Vedic integration configuration
+vedic:
+  use_vedic_core: true
+  vedic_memory_size: 10000
+  vedic_retrieval_top_k: 5
+  vedic_expert_frozen: true
+  vedic_expert_id: 0
+  vedic_routing_weight: 1.5
+  dharmic_alignment_weight: 0.1
+
+# Hierarchical reasoning configuration
+hierarchical_reasoning:
+  use_hierarchical_reasoning: false  # Enable for advanced philosophical reasoning
+  reasoning_levels: 5  # Surface, Logical, Conceptual, Philosophical, Transcendent
+  reasoning_weight: 0.3  # Weight for reasoning-enhanced outputs
+  enable_in_training: false  # Enable reasoning during training
+  confidence_threshold: 0.7  # Minimum confidence for reasoning activation
+
+# Training configuration
+training:
+  # General settings
+  batch_size: 8
+  micro_batch_size: 1
+  gradient_accumulation_steps: 8
+  max_steps: 100000
+  eval_steps: 1000
+  save_steps: 5000
+  logging_steps: 100
+  
+  # Mixed precision
+  use_fp16: false
+  use_bf16: true
+  
+  # Distributed training
+  use_ddp: false
+  use_fsdp: false
+  
+  # Data settings
+  max_seq_length: 2048
+  dataloader_num_workers: 4
+  pin_memory: true
+  
+  # Checkpoint settings
+  output_dir: "./checkpoints"
+  save_total_limit: 5
+  
+  # Evaluation
+  eval_batch_size: 8
+  
+  # Logging
+  use_wandb: false
+  wandb_project: "indra-llm"
+  wandb_run_name: null
+
+# Pre-training configuration
+pretrain:
+  max_lr: 6e-4
+  min_lr: 6e-5
+  warmup_steps: 2000
+  lr_decay_iters: 320000
+  weight_decay: 1e-1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  
+  # Curriculum learning
+  vedic_phase_steps: 50000
+  general_phase_steps: 200000
+  vedic_data_ratio: 0.3
+
+# Supervised Fine-tuning configuration
+sft:
+  max_lr: 5e-5
+  min_lr: 5e-6
+  warmup_steps: 100
+  lr_decay_iters: 10000
+  weight_decay: 1e-2
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  
+  # SFT specific
+  max_seq_length: 2048
+  response_loss_only: true
+
+# RLHF configuration
+rlhf:
+  ppo_epochs: 4
+  learning_rate: 1.4e-5
+  batch_size: 64
+  mini_batch_size: 8
+  gradient_accumulation_steps: 8
+  
+  # PPO hyperparameters
+  gamma: 1.0
+  gae_lambda: 0.95
+  clip_range: 0.2
+  clip_range_vf: null
+  vf_coef: 0.1
+  ent_coef: 0.01
+  kl_coef: 0.1
+  target_kl: 6.0
+  
+  # Vedic alignment
+  vedic_reward_weight: 0.3
+
+# Teacher model for hybrid training
+teacher_model:
+  model_path: "Qwen/Qwen1.5-MoE-A2.7B"
+  use_direct_transfer: true
+  distillation_alpha: 0.7
+  distillation_temperature: 4.0
+
+# Tokenizer configuration
+tokenizer:
+  type: "vedic"  # "sentencepiece" or "vedic"
+  vocab_size: 262154 # Larger for Sanskrit support ## <============= ORignal: 75000
+  model_path: null
+  
+  # Special tokens
+  special_tokens:
+    pad_token: "<pad>"
+    unk_token: "<unk>"
+    bos_token: "<s>"
+    eos_token: "</s>"
+    
+    # Language markers
+    sanskrit_start: "<sanskrit>"
+    sanskrit_end: "</sanskrit>"
+    hindi_start: "<hindi>"
+    hindi_end: "</hindi>"
+    english_start: "<english>"
+    english_end: "</english>"
+    
+    # Vedic markers
+    vedic_start: "<vedic>"
+    vedic_end: "</vedic>"
+    mantra_start: "<mantra>"
+    mantra_end: "</mantra>"
+    
+    # Philosophical concepts
+    dharma_token: "<dharma>"
+    karma_token: "<karma>"
+    ahimsa_token: "<ahimsa>"
+    satya_token: "<satya>"
+
+# Data configuration
+data:
+  # Training data paths
+  train_data:
+    - "dataset/vedic_texts/"
+    - "dataset/indian_languages/"
+    - "dataset/global_languages/"
+  
+  # Validation data
+  val_data:
+    - "dataset/vedic_texts/validation/"
+    - "dataset/indian_languages/validation/"
+  
+  # Data processing
+  data_type: "auto"  # auto-detect format
+  max_seq_length: 2048
+  split_documents: true
+  chunk_size: 1024
+  overlap_size: 128
+  min_length: 10
+  
+  # Language filtering
+  filter_languages:
+    - "sanskrit"
+    - "hindi"
+    - "english"
+  
+  # Sampling weights for multi-language training
+  sampling_weights:
+    sanskrit: 2.0
+    hindi: 1.5
+    english: 1.0
+
+# Inference configuration
+inference:
+  max_new_tokens: 100
+  temperature: 1.0
+  top_k: 50
+  top_p: 0.9
+  repetition_penalty: 1.0
+  do_sample: true
+  use_vedic_mode: true  # Enable Vedic-guided generation
+
+# Evaluation configuration
+evaluation:
+  benchmarks:
+    - "glue"
+    - "superglue"
+    - "hellaswag"
+    - "arc"
+    - "mmlu"
+  
+  # Vedic-specific evaluation
+  vedic_benchmarks:
+    - "vedic_knowledge"
+    - "sanskrit_translation"
+    - "philosophical_reasoning"
+  
+  batch_size: 8
+  max_eval_samples: 1000
+
+# Hardware and optimization
+hardware:
+  # Memory optimization
+  max_memory_gb: 24
+  gradient_checkpointing: false
+  use_8bit: false
+  use_4bit: false
+  
+  # Compilation
+  torch_compile: false
+  compile_mode: "default"
+
+# Logging and monitoring
+logging:
+  log_level: "INFO"
+  log_file: "logs/indra_llm.log"
+  
+  # Metrics to track
+  track_metrics:
+    - "loss"
+    - "perplexity"
+    - "tokens_per_second"
+    - "memory_usage"
+    - "vedic_alignment"
+    - "dharmic_score"
+
+# Paths and directories
+paths:
+  model_save_dir: "./models"
+  checkpoint_dir: "./checkpoints"
+  log_dir: "./logs"
+  cache_dir: "./cache"
+  tokenizer_dir: "./tokenizers"
+
+# Model scaling configurations for different sizes
+model_configs:
+  # 2M parameters (prototyping)
+  tiny:
+    n_embd: 256
+    n_layer: 4
+    n_head: 4
+    n_kv_head: 2
+    intermediate_size: 1024
+    
+  # 10M parameters
+  small:
+    n_embd: 512
+    n_layer: 6
+    n_head: 8
+    n_kv_head: 2
+    intermediate_size: 2048
+    
+  # 100M parameters
+  medium:
+    n_embd: 768
+    n_layer: 12
+    n_head: 12
+    n_kv_head: 4
+    intermediate_size: 3072
+    
+  # 500M parameters
+  large:
+    n_embd: 1024
+    n_layer: 18
+    n_head: 16
+    n_kv_head: 4
+    intermediate_size: 4096
+    
+  # 1B parameters
+  xl:
+    n_embd: 1536
+    n_layer: 20
+    n_head: 24
+    n_kv_head: 6
+    intermediate_size: 6144
+    
+  # 7B parameters
+  xxl:
+    n_embd: 4096
+    n_layer: 32
+    n_head: 32
+    n_kv_head: 8
+    intermediate_size: 14336

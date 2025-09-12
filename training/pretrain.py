@@ -1,0 +1,546 @@
+"""
+Pre-training implementation for INDRA LLM with Vedic curriculum learning
+(c) Divyansh Bharadwaj
+"""
+
+import os
+import time
+import logging
+from typing import Dict, Optional, Any
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torch.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+from .trainer_utils import TrainerUtils, get_optimizer, get_scheduler, MetricsTracker
+from data import create_dataloader, VedicDataset, MultiLanguageDataset
+from model import INDRATransformer
+
+class PretrainTrainer:
+    """Pre-training trainer with Vedic curriculum learning."""
+    
+    def __init__(
+        self,
+        model: INDRATransformer,
+        config,
+        train_dataset,
+        val_dataset=None,
+        tokenizer=None,
+    ):
+        """
+        Initialize pre-training trainer.
+        
+        Args:
+            model: INDRA transformer model
+            config: Training configuration
+            train_dataset: Training dataset
+            val_dataset: Validation dataset
+            tokenizer: Tokenizer instance
+        """
+        self.model = model
+        self.config = config
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        self.tokenizer = tokenizer
+        
+        # Setup device and distributed training
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.is_distributed = config.use_ddp or config.use_fsdp
+        
+        if self.is_distributed:
+            self.model = self._setup_distributed_model()
+        else:
+            self.model = self.model.to(self.device)
+        
+        # Setup optimizer and scheduler
+        self.optimizer = get_optimizer(
+            self.model,
+            optimizer_name="adamw",
+            learning_rate=config.pretrain.max_lr,
+            weight_decay=config.pretrain.weight_decay,
+            beta1=config.pretrain.beta1,
+            beta2=config.pretrain.beta2,
+        )
+        
+        self.scheduler = get_scheduler(
+            self.optimizer,
+            scheduler_name="cosine",
+            warmup_steps=config.pretrain.warmup_steps,
+            max_steps=config.max_steps,
+            min_lr_ratio=config.pretrain.min_lr / config.pretrain.max_lr,
+        )
+        
+        # Setup mixed precision
+        device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.scaler = GradScaler(device_type, enabled=config.use_fp16 or config.use_bf16)
+        self.use_amp = config.use_fp16 or config.use_bf16
+        self.amp_dtype = torch.float16 if config.use_fp16 else torch.bfloat16
+
+        # Vedic curriculum phases
+        self.current_phase = "vedic"  # vedic -> general -> mixed
+        self.phase_steps = {
+            "vedic": config.pretrain.vedic_phase_steps,
+            "general": config.pretrain.general_phase_steps,
+            "mixed": config.max_steps - config.pretrain.vedic_phase_steps - config.pretrain.general_phase_steps
+        }
+        
+        # Setup data loaders
+        self.train_loader = self._create_train_loader()
+        self.val_loader = self._create_val_loader() if val_dataset else None
+        
+        # Tracking and logging
+        self.metrics_tracker = MetricsTracker(window_size=config.logging_steps)
+        self.global_step = 0
+        self.epoch = 0
+        
+        # Setup logging
+        TrainerUtils.setup_logging()
+        self.wandb = TrainerUtils.setup_wandb(
+            vars(config), config.wandb_project, config.wandb_run_name
+        )
+        
+        # Log model info
+        param_counts = TrainerUtils.count_parameters(self.model)
+        logging.info(f"Model parameters: {param_counts}")
+        
+    def _setup_distributed_model(self) -> nn.Module:
+        """Setup model for distributed training."""
+        if self.config.use_fsdp:
+            try:
+                from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+                from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+                from .model.transformer import TransformerBlock
+                
+                auto_wrap_policy = transformer_auto_wrap_policy({TransformerBlock})
+                model = FSDP(
+                    self.model,
+                    auto_wrap_policy=auto_wrap_policy,
+                    mixed_precision=None,  # Handle separately
+                )
+                return model
+            except ImportError:
+                logging.warning("FSDP not available, falling back to DDP")
+        
+        if self.config.use_ddp:
+            model = DDP(self.model, device_ids=[self.config.local_rank])
+            return model
+        
+        return self.model.to(self.device)
+    
+    def _create_train_loader(self) -> DataLoader:
+        """Create training data loader with curriculum learning."""
+        if isinstance(self.train_dataset, VedicDataset):
+            # Use Vedic priority sampler
+            return create_dataloader(
+                self.train_dataset,
+                batch_size=self.config.batch_size,
+                shuffle=True,
+                num_workers=self.config.dataloader_num_workers,
+                sampler_type="vedic_priority",
+                phase=self.current_phase,
+                vedic_ratio=self.config.pretrain.vedic_data_ratio,
+                pin_memory=self.config.pin_memory,
+            )
+        elif isinstance(self.train_dataset, MultiLanguageDataset):
+            # Use language-aware sampler
+            return create_dataloader(
+                self.train_dataset,
+                batch_size=self.config.batch_size,
+                shuffle=True,
+                num_workers=self.config.dataloader_num_workers,
+                sampler_type="language_aware",
+                language_weights={'sanskrit': 2.0, 'hindi': 1.5, 'english': 1.0},
+                pin_memory=self.config.pin_memory,
+            )
+        else:
+            # Standard data loader
+            return create_dataloader(
+                self.train_dataset,
+                batch_size=self.config.batch_size,
+                shuffle=True,
+                num_workers=self.config.dataloader_num_workers,
+                pin_memory=self.config.pin_memory,
+            )
+    
+    def _create_val_loader(self) -> Optional[DataLoader]:
+        """Create validation data loader."""
+        if not self.val_dataset:
+            return None
+        
+        return create_dataloader(
+            self.val_dataset,
+            batch_size=self.config.eval_batch_size,
+            shuffle=False,
+            num_workers=self.config.dataloader_num_workers,
+            pin_memory=self.config.pin_memory,
+        )
+    
+    def _update_curriculum_phase(self):
+        """Update curriculum learning phase based on current step."""
+        if self.global_step < self.phase_steps["vedic"]:
+            new_phase = "vedic"
+        elif self.global_step < self.phase_steps["vedic"] + self.phase_steps["general"]:
+            new_phase = "general"
+        else:
+            new_phase = "mixed"
+        
+        if new_phase != self.current_phase:
+            logging.info(f"Curriculum phase transition: {self.current_phase} -> {new_phase}")
+            self.current_phase = new_phase
+            
+            # Update data loader if needed
+            if isinstance(self.train_dataset, VedicDataset):
+                self.train_loader = self._create_train_loader()
+    
+    def train(self) -> Dict[str, Any]:
+        """Main training loop."""
+        logging.info(f"Starting pre-training for {self.config.max_steps} steps")
+        
+        self.model.train()
+        start_time = time.time()
+        
+        # Training loop
+        while self.global_step < self.config.max_steps:
+            epoch_loss = self._train_epoch()
+            
+            # Validation
+            if self.val_loader and self.global_step % self.config.eval_steps == 0:
+                val_metrics = self._validate()
+                self.metrics_tracker.update(val_metrics, self.global_step)
+                
+                if self.wandb:
+                    self.wandb.log(val_metrics, step=self.global_step)
+            
+            # Save checkpoint
+            if self.global_step % self.config.save_steps == 0:
+                self._save_checkpoint()
+            
+            # Update curriculum phase
+            self._update_curriculum_phase()
+            
+            self.epoch += 1
+            
+            if self.global_step >= self.config.max_steps:
+                break
+        
+        # Final validation and save
+        if self.val_loader:
+            final_metrics = self._validate()
+            logging.info(f"Final validation metrics: {final_metrics}")
+        
+        self._save_checkpoint(final=True)
+        
+        total_time = time.time() - start_time
+        logging.info(f"Pre-training completed in {total_time:.2f} seconds")
+        
+        return {
+            'final_step': self.global_step,
+            'total_time': total_time,
+            'final_metrics': self.metrics_tracker.get_summary()
+        }
+    
+    # def _train_epoch(self) -> float:
+    #     """Train for one epoch."""
+    #     self.model.train()
+    #     epoch_loss = 0.0
+    #     step_count = 0
+        
+    #     for batch_idx, batch in enumerate(self.train_loader):
+    #         print(f"Processing batch {batch_idx}, step {self.current_step}")
+            
+    #         try:
+    #             loss = self._train_step(batch)
+    #             epoch_loss += loss
+    #             step_count += 1
+                
+    #             # Log progress
+    #             if step_count % self.config.logging_steps == 0:
+    #                 avg_loss = epoch_loss / step_count
+    #                 print(f"Step {self.current_step}: Loss = {loss:.4f}, Avg Loss = {avg_loss:.4f}")
+                
+    #             # Check if we should stop
+    #             if self.current_step >= self.config.max_steps:
+    #                 print(f"Reached max steps ({self.config.max_steps}), stopping...")
+    #                 break
+                    
+    #             # CRITICAL: Increment step counter
+    #             self.current_step += 1
+                
+    #         except Exception as e:
+    #             print(f"Error in training step {batch_idx}: {e}")
+    #             import traceback
+    #             traceback.print_exc()
+    #             break
+        
+    #     return epoch_loss / max(step_count, 1)
+
+    def _train_epoch(self) -> float:
+        """Train for one epoch."""
+        epoch_loss = 0.0
+        num_batches = 0
+        
+        for batch_idx, batch in enumerate(self.train_loader):
+            if self.global_step >= self.config.max_steps:
+                break
+            
+            loss = self._train_step(batch)
+            epoch_loss += loss
+            num_batches += 1
+            
+            # Logging
+            if self.global_step % self.config.logging_steps == 0:
+                self._log_metrics(loss)
+            
+            self.global_step += 1
+        
+        return epoch_loss / max(num_batches, 1)
+
+    # def _train_step(self, batch):
+    #     """Single training step with debugging."""
+    #     print(f"Training step {self.current_step} starting...")
+        
+    #     # Move batch to device
+    #     batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+    #              for k, v in batch.items()}
+        
+    #     # Remove the repeated debug prints from transformer.py
+    #     # The issue is likely here - check if this step actually completes
+        
+    #     try:
+    #         outputs = self.model(
+    #             input_ids=batch['input_ids'],
+    #             attention_mask=batch['attention_mask'],
+    #             labels=batch['labels'],
+    #             compute_vedic_rewards=True,
+    #         )
+            
+    #         loss = outputs['loss'] if isinstance(outputs, dict) else outputs[0]
+    #         print(f"Training step {self.current_step} completed with loss: {loss.item():.4f}")
+            
+    #         # Backward pass
+    #         loss.backward()
+            
+    #         # Gradient step
+    #         if (self.current_step + 1) % self.config.gradient_accumulation_steps == 0:
+    #             self.optimizer.step()
+    #             self.optimizer.zero_grad()
+            
+    #         return loss.item()
+            
+    #     except Exception as e:
+    #         print(f"Error in _train_step: {e}")
+    #         raise
+    
+    def _train_step(self, batch: Dict[str, torch.Tensor]) -> float:
+        """Single training step."""
+        try:
+          # Move batch to device
+          batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                  for k, v in batch.items()}
+          
+          # Forward pass with mixed precision
+          device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
+          use_autocast = (self.use_amp and torch.cuda.is_available())
+          
+          if use_autocast:
+              with autocast(device_type, dtype=self.amp_dtype):
+                  outputs = self.model(
+                      input_ids=batch['input_ids'],
+                      attention_mask=batch['attention_mask'],
+                      labels=batch['labels'],
+                      compute_vedic_rewards=True,
+                  )
+                  loss = outputs['loss'] if isinstance(outputs, dict) else outputs.loss
+
+          else:
+              outputs = self.model(
+                  input_ids=batch['input_ids'],
+                  attention_mask=batch['attention_mask'],
+                  labels=batch['labels'],
+                  compute_vedic_rewards=True,
+              )
+              loss = outputs['loss'] if isinstance(outputs, dict) else outputs.loss
+              
+              # loss = outputs['loss']
+              
+              # # Scale loss for gradient accumulation
+              # loss = loss / self.config.gradient_accumulation_steps
+          
+          # Backward pass
+          if self.use_amp:
+              self.scaler.scale(loss).backward()
+          else:
+              loss.backward()
+          
+          # Gradient accumulation
+          if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
+              # Gradient clipping
+              if self.use_amp:
+                  self.scaler.unscale_(self.optimizer)
+              
+              torch.nn.utils.clip_grad_norm_(
+                  self.model.parameters(), 
+                  self.config.pretrain.grad_clip
+              )
+              
+              # Optimizer step
+              if self.use_amp:
+                  self.scaler.step(self.optimizer)
+                  self.scaler.update()
+              else:
+                  self.optimizer.step()
+              
+              self.scheduler.step()
+              self.optimizer.zero_grad()
+          
+          return loss.item() * self.config.gradient_accumulation_steps
+
+        except Exception as e:
+            logging.error(f"Error in training step: {e}")
+            logging.error(f"Batch keys: {list(batch.keys()) if isinstance(batch, dict) else 'Not a dict'}")
+            
+            # Log batch information for debugging
+            if isinstance(batch, dict):
+                for k, v in batch.items():
+                    if isinstance(v, torch.Tensor):
+                        logging.error(f"  {k}: shape {v.shape}, dtype {v.dtype}, device {v.device}")
+                    else:
+                        logging.error(f"  {k}: {type(v)}")
+            
+            # Re-raise the exception to stop training
+            raise
+    
+    def _validate(self) -> Dict[str, float]:
+        """Run validation."""
+        self.model.eval()
+        
+        total_loss = 0.0
+        total_aux_loss = 0.0
+        total_vedic_loss = 0.0
+        num_batches = 0
+        
+        with torch.no_grad():
+            for batch in self.val_loader:
+                # Move batch to device
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                        for k, v in batch.items()}
+                
+                # Forward pass
+                with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+                    outputs = self.model(
+                        input_ids=batch['input_ids'],
+                        attention_mask=batch.get('attention_mask'),
+                        labels=batch.get('labels'),
+                        compute_vedic_rewards=True
+                    )
+                
+                total_loss += outputs['loss'].item()
+                total_aux_loss += outputs.get('aux_losses', {}).get('total_aux_loss', 0.0)
+                total_vedic_loss += outputs.get('aux_losses', {}).get('vedic_alignment_loss', 0.0)
+                num_batches += 1
+        
+        self.model.train()
+        
+        return {
+            'val_loss': total_loss / max(num_batches, 1),
+            'val_aux_loss': total_aux_loss / max(num_batches, 1),
+            'val_vedic_loss': total_vedic_loss / max(num_batches, 1),
+        }
+    
+    def _log_metrics(self, loss: float):
+        """Log training metrics."""
+        # Calculate tokens per second
+        current_time = time.time()
+        if not hasattr(self, '_last_log_time'):
+            self._last_log_time = current_time
+            self._last_log_step = self.global_step
+            return
+        
+        time_diff = current_time - self._last_log_time
+        step_diff = self.global_step - self._last_log_step
+        
+        if time_diff > 0:
+            tokens_per_sec = TrainerUtils.estimate_tokens_per_second(
+                self.config.batch_size,
+                self.config.max_seq_length,
+                time_diff / step_diff,
+                self.config.gradient_accumulation_steps
+            )
+        else:
+            tokens_per_sec = 0.0
+        
+        # Get memory usage
+        memory_stats = TrainerUtils.get_memory_usage()
+        
+        # Current learning rate
+        current_lr = self.scheduler.get_last_lr()[0]
+        
+        metrics = {
+            'train_loss': loss,
+            'learning_rate': current_lr,
+            'tokens_per_second': tokens_per_sec,
+            'global_step': self.global_step,
+            'epoch': self.epoch,
+            'curriculum_phase': self.current_phase,
+        }
+        metrics.update(memory_stats)
+        
+        # Update tracker
+        self.metrics_tracker.update(metrics, self.global_step)
+        
+        # Log to console
+        logging.info(
+            f"Step {self.global_step}: loss={loss:.4f}, lr={current_lr:.2e}, "
+            f"tokens/s={tokens_per_sec:.0f}, phase={self.current_phase}"
+        )
+        
+        # Log to wandb
+        if self.wandb:
+            self.wandb.log(metrics, step=self.global_step)
+        
+        self._last_log_time = current_time
+        self._last_log_step = self.global_step
+    
+    def _save_checkpoint(self, final: bool = False):
+        """Save model checkpoint."""
+        suffix = "final" if final else f"step-{self.global_step}"
+        
+        TrainerUtils.save_checkpoint(
+            model=self.model.module if isinstance(self.model, (DDP,)) else self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            step=self.global_step,
+            loss=self.metrics_tracker.get_latest('train_loss'),
+            checkpoint_dir=self.config.output_dir,
+            config=vars(self.config),
+            save_format="both"
+        )
+        
+        # Cleanup old checkpoints
+        if not final:
+            TrainerUtils.cleanup_checkpoints(
+                self.config.output_dir, 
+                keep_latest=self.config.save_total_limit
+            )
+    
+    def resume_from_checkpoint(self, checkpoint_path: str):
+        """Resume training from checkpoint."""
+        logging.info(f"Resuming from checkpoint: {checkpoint_path}")
+        
+        checkpoint_info = TrainerUtils.load_checkpoint(
+            checkpoint_path,
+            model=self.model.module if isinstance(self.model, DDP) else self.model,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            device=self.device
+        )
+        
+        self.global_step = checkpoint_info.get('step', 0)
+        self.epoch = checkpoint_info.get('epoch', 0)
+        
+        logging.info(f"Resumed from step {self.global_step}")
+        
+        return checkpoint_info
