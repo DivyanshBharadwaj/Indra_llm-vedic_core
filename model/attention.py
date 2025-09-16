@@ -106,7 +106,19 @@ class GroupedQueryAttention(nn.Module):
         if self.rotary_emb is not None:
             if position_ids is None:
                 position_ids = torch.arange(seq_len, device=hidden_states.device)
-            cos, sin = self.rotary_emb(seq_len, hidden_states.device)
+                
+            # --- START OF FIX ---
+            # Determine the past sequence length from the cache to create a correctly sized RoPE table.
+            past_seq_len = 0
+            if past_key_value is not None:
+                # cache_k has shape [batch, num_kv_heads, seq_len, head_dim]
+                past_seq_len = past_key_value[0].shape[2]
+            
+            # Generate embeddings for the full sequence length (cache + new tokens)
+            total_seq_len = past_seq_len + seq_len
+            cos, sin = self.rotary_emb(total_seq_len, hidden_states.device)
+            # --- END OF FIX ---
+            
             q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
         
         # Handle KV cache
