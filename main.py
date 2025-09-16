@@ -6,6 +6,7 @@ Main entry point for INDRA LLM - Vedic-aligned Decoder-only Transformer
 import argparse
 import logging
 import os
+import glob
 import sys
 from pathlib import Path
 
@@ -24,7 +25,45 @@ from training import PretrainTrainer, HybridPretrainTrainer, SFTTrainer, RLHFTra
 from inference import InferenceEngine, VedicInferenceEngine
 from evaluation import Evaluator, VedicEvaluator
 
+def debug_data_pipeline(args, train_dataset_obj):
+    """A helper function to debug the data loading process."""
+    print("\n" + "="*50)
+    print("--- DATA PIPELINE DEBUGGER (v2) ---")
+    
+    # 1. Check paths from command-line arguments
+    train_path = args.train_data[0] if args.train_data else "Not Provided"
+    vedic_path = args.vedic_data[0] if args.vedic_data else "Not Provided"
 
+    print(f"\n[1] Checking General Training Data Path: '{train_path}'")
+    if os.path.exists(train_path):
+        print(f"    -> Path EXISTS.")
+        general_files = glob.glob(os.path.join(train_path, '**/*.txt'), recursive=True)
+        print(f"    -> Found {len(general_files)} '.txt' files in this directory.")
+    else:
+        print(f"    -> ERROR: Path DOES NOT EXIST.")
+
+    print(f"\n[2] Checking Vedic Training Data Path: '{vedic_path}'")
+    if os.path.exists(vedic_path):
+        print(f"    -> Path EXISTS.")
+        vedic_files = glob.glob(os.path.join(vedic_path, '**/*.txt'), recursive=True)
+        print(f"    -> Found {len(vedic_files)} '.txt' files in this directory.")
+    else:
+        print(f"    -> ERROR: Path DOES NOT EXIST.")
+
+    # 2. Check the created dataset object itself
+    print(f"\n[3] Checking the created Dataset object:")
+    if train_dataset_obj:
+        try:
+            num_examples = len(train_dataset_obj)
+            print(f"    -> The created dataset reports it has {num_examples} examples.")
+            if num_examples < 10:
+                print("    -> WARNING: The number of examples is extremely small for pre-training.")
+        except Exception as e:
+            print(f"    -> Could not determine the length of the dataset object. Error: {e}")
+    else:
+        print("    -> The created dataset object is None.")
+
+    print("\n" + "="*50 + "\n")
 
 def get_args():
     """Comprehensive argument parser supporting all configuration options."""
@@ -387,6 +426,9 @@ def pretrain_mode(args):
     # Create tokenizer and datasets
     tokenizer = create_tokenizer(args)
     train_dataset, val_dataset = create_datasets(args, tokenizer)
+
+    debug_data_pipeline(args, train_dataset)
+
     
     if not train_dataset:
         raise ValueError("No training dataset provided")
