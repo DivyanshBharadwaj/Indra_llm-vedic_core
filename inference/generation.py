@@ -237,8 +237,8 @@ class InferenceEngine:
                     use_cache=config.use_cache,
                 )
             
-            logits = outputs.logits[:, -1, :]  # Last token logits
-            past_key_values = outputs.past_key_values if config.use_cache else None
+            logits = outputs['logits'][:, -1, :]  # Last token logits
+            past_key_values = outputs['past_key_values'] if config.use_cache else None
             
             # Apply repetition penalty
             if config.repetition_penalty != 1.0:
@@ -268,10 +268,36 @@ class InferenceEngine:
                 
                 # Sample from distribution
                 probs = F.softmax(logits, dim=-1)
-                next_tokens = torch.multinomial(probs, num_samples=1)
-            else:
-                # Greedy decoding
-                next_tokens = torch.argmax(logits, dim=-1, keepdim=True)
+                
+                # --- START OF FIX ---
+                # Add this block to handle numerical instability
+                if torch.isinf(probs).any() or torch.isnan(probs).any():
+                    # All logits were likely -inf. This happens when the model is very confused.
+                    # We'll just select the token with the highest original logit before filtering.
+                    # If you have an <unk> token, using it would be even better.
+                    print("WARNING: Encountered nan probabilities, falling back to greedy decoding of original logits.")
+                    
+                    # --- START OF FIX ---
+                    with torch.no_grad():
+                        # The input_ids here MUST be just the last token for a decoding step.
+                        fallback_input_ids = generated_ids[:, -1:]
+                        
+                        outputs = self.model(
+                            input_ids=fallback_input_ids, # Use the corrected input_ids
+                            attention_mask=None,          # attention_mask is not needed with cache
+                            past_key_values=past_key_values,
+                            use_cache=config.use_cache,
+                        )
+                    next_tokens = torch.argmax(outputs['logits'][:, -1, :], dim=-1, keepdim=True)                
+                else:
+                    # Original sampling logic
+                    next_tokens = torch.multinomial(probs, num_samples=1)
+                # --- END OF FIX ---
+            
+##                next_tokens = torch.multinomial(probs, num_samples=1)
+##            else:
+##                # Greedy decoding
+##                next_tokens = torch.argmax(logits, dim=-1, keepdim=True)
             
             # Update generated sequence
             generated_ids = torch.cat([generated_ids, next_tokens], dim=-1)
@@ -327,8 +353,8 @@ class InferenceEngine:
                     use_cache=config.use_cache,
                 )
             
-            logits = outputs.logits[:, -1, :]
-            past_key_values = outputs.past_key_values if config.use_cache else None
+            logits = outputs['logits'][:, -1, :]
+            past_key_values = outputs['past_key_values'] if config.use_cache else None
             
             # Apply repetition penalty
             if config.repetition_penalty != 1.0:
@@ -537,8 +563,8 @@ class InferenceEngine:
                     use_cache=generation_config.use_cache,
                 )
             
-            logits = outputs.logits[:, -1, :]
-            past_key_values = outputs.past_key_values if generation_config.use_cache else None
+            logits = outputs['logits'][:, -1, :]
+            past_key_values = outputs['past_key_values'] if generation_config.use_cache else None
             
             # Apply generation constraints
             if generation_config.repetition_penalty != 1.0:
