@@ -206,7 +206,8 @@ class SFTTrainer:
             aux_losses = outputs.get('aux_losses', {})
             vedic_alignment_loss = aux_losses.get('vedic_alignment_loss', 0.0)
             
-            if isinstance(vedic_alignment_loss, torch.Tensor):
+##            if isinstance(vedic_alignment_loss, torch.Tensor):
+            if isinstance(vedic_alignment_loss, torch.Tensor) and not (torch.isnan(vedic_alignment_loss) or torch.isinf(vedic_alignment_loss)):
                 loss = loss + 0.1 * vedic_alignment_loss  # Small weight for SFT
             
             # Scale loss for gradient accumulation
