@@ -14,7 +14,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .trainer_utils import TrainerUtils, get_optimizer, get_scheduler, MetricsTracker
@@ -546,3 +546,4 @@ class PretrainTrainer:
         logging.info(f"Resumed from step {self.global_step}")
         
         return checkpoint_info
+
