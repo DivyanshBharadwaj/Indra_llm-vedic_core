@@ -443,6 +443,7 @@ class INDRATransformer(nn.Module):
             if compute_vedic_rewards and 'combined_reward' in vedic_metrics:
                 # Convert rewards to alignment loss (negative reward)
                 vedic_rewards = torch.stack([r.mean() for r in vedic_metrics['combined_reward']])
+                clipped_reward = torch.clamp(vedic_rewards.mean(), min=-5.0, max=5.0)
                 vedic_alignment_loss = -vedic_rewards.mean() * self.config.vedic.dharmic_alignment_weight
                 aux_losses['vedic_alignment_loss'] = vedic_alignment_loss
                 total_aux_loss += vedic_alignment_loss
@@ -585,3 +586,4 @@ class INDRATransformer(nn.Module):
                     break
         
         return generated_ids
+
