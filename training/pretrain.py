@@ -348,7 +348,7 @@ class PretrainTrainer:
           use_autocast = (self.use_amp and torch.cuda.is_available())
           
           if use_autocast:
-              with autocast(device_type=device_type, dtype=self.amp_dtype, enabled=self.use_amp):
+              with autocast(dtype=self.amp_dtype, enabled=self.use_amp):
                   outputs = self.model(
                       input_ids=batch['input_ids'],
                       attention_mask=batch['attention_mask'],
@@ -432,7 +432,7 @@ class PretrainTrainer:
                 
                 # Forward pass
 ##                with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
-                with autocast(device_type=device_type, dtype=self.amp_dtype, enabled=self.use_amp):
+                with autocast(dtype=self.amp_dtype, enabled=self.use_amp):
                     outputs = self.model(
                         input_ids=batch['input_ids'],
                         attention_mask=batch.get('attention_mask'),
@@ -547,5 +547,6 @@ class PretrainTrainer:
         logging.info(f"Resumed from step {self.global_step}")
         
         return checkpoint_info
+
 
 
