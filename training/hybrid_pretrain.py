@@ -478,7 +478,8 @@ class HybridPretrainTrainer(PretrainTrainer):
             teacher_logits = self._get_teacher_outputs(batch)
         
         # Forward pass with mixed precision
-        with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+        with autocast(device_type=device_type, dtype=self.amp_dtype, enabled=self.use_amp):
+##        with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
             outputs = self.model(
                 input_ids=batch['input_ids'],
                 attention_mask=batch.get('attention_mask'),
@@ -633,3 +634,4 @@ class HybridPretrainTrainer(PretrainTrainer):
         
         self._last_log_time = current_time
         self._last_log_step = self.global_step
+
