@@ -1,125 +1,67 @@
 # INDRA LLM Requirements
 # Vedic-aligned Decoder-only Transformer LLM
 # (c) Divyansh Bharadwaj
-
-# Core PyTorch and ML
 torch>=2.1.0
-torchvision>=0.16.0
-torchaudio>=2.1.0
+torchvision>=0.16.0,<0.17.0
+torchaudio>=2.1.0,<2.2.0
 transformers>=4.35.0
 tokenizers>=0.14.0
-sentencepiece>=0.1.99
-
-# Data processing and utilities
 datasets>=2.14.0
+accelerate>=0.24.0
+evaluate>=0.4.0
+safetensors>=0.4.0
+huggingface-hub>=0.17.0
 pandas>=2.0.0
-numpy>=1.24.0
-scipy>=1.11.0
+numpy>=1.24.0,<1.25.0
+scipy>=1.11.0,<1.12.0
 scikit-learn>=1.3.0
-
-# Text processing and NLP
+pyarrow>=13.0.0
+fastparquet>=2023.10.1
+sentencepiece>=0.1.99
 nltk>=3.8.0
 regex>=2023.10.3
 unidecode>=1.3.7
 ftfy>=6.1.1
-
-# Sanskrit and Indic language support
+rouge-score>=0.1.2
+sacrebleu>=2.3.0
 indic-transliteration>=2.3.43
 aksharamukha>=2.1.1
 pyicu>=2.11
 polyglot>=16.7.4
-
-# Tokenization
-sentencepiece>=0.1.99
-tokenizers>=0.14.0
-
-# Efficient attention and optimization
-flash-attn>=2.3.0  # FlashAttention (requires CUDA)
-xformers>=0.0.22  # Alternative efficient attention
-triton>=2.1.0  # For custom kernels
-
-# Model serialization and safety
-safetensors>=0.4.0
-huggingface-hub>=0.17.0
-
-# Distributed training
-accelerate>=0.24.0
-deepspeed>=0.11.0  # Optional for advanced optimization
-
-# Mixed precision and optimization
-bitsandbytes>=0.41.0  # Optional for 8-bit training
-apex  # NVIDIA Apex (optional, requires manual install)
-
-# Logging and monitoring
-wandb>=0.15.0
-tensorboard>=2.14.0
-rich>=13.0.0
-tqdm>=4.66.0
-
-# Configuration and utilities
 pyyaml>=6.0
 omegaconf>=2.3.0
 hydra-core>=1.3.0
 click>=8.1.0
 python-dotenv>=1.0.0
-
-# Evaluation and benchmarks
-evaluate>=0.4.0
-rouge-score>=0.1.2
-sacrebleu>=2.3.0
-bleurt>=0.0.2  # Optional for advanced evaluation
-
-# Data formats and I/O
+tqdm>=4.66.0
+rich>=13.0.0
 jsonlines>=3.1.0
-pyarrow>=13.0.0
-fastparquet>=2023.10.1
 lxml>=4.9.0
 beautifulsoup4>=4.12.0
-
-# Numerical and scientific computing
-matplotlib>=3.7.0
-seaborn>=0.12.0
-plotly>=5.17.0
-
-# Development and testing
+flash-attn>=2.3.0
+xformers>=0.0.22
+triton>=2.1.0
+deepspeed>=0.11.0
+bitsandbytes>=0.41.0
+bleurt>=0.0.2
+optimum>=1.14.0
+onnx>=1.14.0
+onnxruntime>=1.16.0
+onnxruntime-gpu>=1.16.0
+horovod>=0.28.0
+ray>=2.7.0
+fastapi>=0.104.0
+uvicorn>=0.24.0
+gradio>=3.50.0
+wandb>=0.15.0
+tensorboard>=2.14.0
 pytest>=7.4.0
 black>=23.9.0
 flake8>=6.1.0
 mypy>=1.6.0
 pre-commit>=3.5.0
-
-# Documentation
 sphinx>=7.2.0
 sphinx-rtd-theme>=1.3.0
-
-# Optional GPU acceleration
-nvidia-ml-py>=12.535.0  # NVIDIA GPU monitoring
-pynvml>=11.5.0
-
-# Optional model compression
-optimum>=1.14.0
-onnx>=1.14.0
-onnxruntime>=1.16.0
-onnxruntime-gpu>=1.16.0
-
-# Optional distributed training frameworks
-horovod>=0.28.0  # Optional for multi-node training
-ray>=2.7.0  # Optional for distributed computing
-
-# Optional model serving
-fastapi>=0.104.0  # For API endpoints
-uvicorn>=0.24.0
-gradio>=3.50.0  # For web interface
-
-# System and process management
-psutil>=5.9.0
-gpustat>=1.1.0
-
-# Version constraints for stability
-# Ensure compatibility between packages
-torch-audio>=2.1.0,<2.2.0
-torch-vision>=0.16.0,<0.17.0
-
-# Pin critical versions for reproducibility
-numpy>=1.24.0,<1.25.0  # Stability with PyTorch
-scipy>=1.11.0,<1.12.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.17.0
