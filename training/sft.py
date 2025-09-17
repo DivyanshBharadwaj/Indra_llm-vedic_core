@@ -192,7 +192,8 @@ class SFTTrainer:
                 for k, v in batch.items()}
         
         # Forward pass with mixed precision
-        with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+##        with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+        with autocast(device_type=device_type, dtype=self.amp_dtype, enabled=self.use_amp):
             outputs = self.model(
                 input_ids=batch['input_ids'],
                 attention_mask=batch.get('attention_mask'),
@@ -260,7 +261,8 @@ class SFTTrainer:
                         for k, v in batch.items()}
                 
                 # Forward pass
-                with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+##                with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+                with autocast(device_type=device_type, dtype=self.amp_dtype, enabled=self.use_amp):
                     outputs = self.model(
                         input_ids=batch['input_ids'],
                         attention_mask=batch.get('attention_mask'),
@@ -499,3 +501,4 @@ class SFTTrainer:
         results['response_rate'] = non_empty_count / max(len(response_lengths), 1)
         
         return results
+
