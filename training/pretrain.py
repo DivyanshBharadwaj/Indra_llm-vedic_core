@@ -77,7 +77,7 @@ class PretrainTrainer:
         
         # Setup mixed precision
         device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.scaler = GradScaler(device_type, enabled=config.use_fp16 or config.use_bf16)
+        self.scaler = GradScaler(enabled=config.use_fp16 or config.use_bf16)
         self.use_amp = config.use_fp16 or config.use_bf16
         self.amp_dtype = torch.float16 if config.use_fp16 else torch.bfloat16
 
@@ -547,6 +547,3 @@ class PretrainTrainer:
         logging.info(f"Resumed from step {self.global_step}")
         
         return checkpoint_info
-
-
-
