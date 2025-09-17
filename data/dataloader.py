@@ -60,52 +60,44 @@ class INDRADataLoader:
             persistent_workers=persistent_workers,
         )
     
+    # REPLACE the old _default_collate_fn method in dataloader.py with this one
+
     def _default_collate_fn(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
-        """Default collation function for batching."""
+        """Default collation function for batching that handles inconsistent keys."""
         if not batch:
             return {}
         
-        # Get all keys from the first item
-        keys = batch[0].keys()
+        # Get a union of all keys present in the batch
+        all_keys = set()
+        for item in batch:
+            all_keys.update(item.keys())
+            
         result = {}
         
-        for key in keys:
-            values = [item[key] for item in batch]
+        for key in all_keys:
+            # For tensor keys, we need to handle missing items robustly
+            if key in ['input_ids', 'attention_mask', 'labels', 'vedic_weights']:
+                # Find the first item that has the key to determine the shape and dtype
+                present_item = next((item for item in batch if key in item), None)
+                if present_item is None: continue # Skip if key is not in any item
+                
+                example_tensor = present_item[key]
+                default_tensor = torch.zeros_like(example_tensor)
+                
+                values = [item.get(key, default_tensor) for item in batch]
+                result[key] = torch.stack(values)
             
-            # Handle different types of values
-            if key in ['input_ids', 'attention_mask', 'labels']:
-                # Stack tensor values
-                if isinstance(values[0], torch.Tensor):
-                    result[key] = torch.stack(values)
-                else:
-                    result[key] = torch.tensor(values)
-            
-            elif key == 'vedic_weights':
-                # Handle Vedic attention weights
-                if isinstance(values[0], torch.Tensor):
-                    result[key] = torch.stack(values)
-                else:
-                    result[key] = torch.tensor(values, dtype=torch.float)
-            
-            elif key in ['is_vedic', 'language']:
-                # Handle categorical data
-                if isinstance(values[0], torch.Tensor):
-                    result[key] = torch.stack(values)
-                elif isinstance(values[0], str):
-                    result[key] = values  # Keep as list of strings
-                else:
-                    result[key] = torch.tensor(values)
-            
+            # For other non-tensor metadata
             else:
-                # Keep other values as lists or try to tensorize
-                try:
-                    if isinstance(values[0], (int, float)):
-                        result[key] = torch.tensor(values)
-                    else:
-                        result[key] = values
-                except Exception:
-                    result[key] = values
-        
+                values = [item.get(key, None) for item in batch]
+                result[key] = values
+
+        # Ensure essential keys are present
+        for essential_key in ['input_ids', 'attention_mask', 'labels']:
+            if essential_key not in result:
+                dummy_tensor = torch.zeros(len(batch), self.dataset.max_length, dtype=torch.long)
+                result[essential_key] = dummy_tensor
+
         return result
     
     def __iter__(self):
