@@ -1,5 +1,4 @@
 # === Core Hugging Face Ecosystem ===
-# (PyTorch, torchvision, torchaudio are installed separately)
 transformers>=4.35.0
 tokenizers>=0.14.0
 datasets>=2.14.0
@@ -8,26 +7,21 @@ evaluate>=0.4.0
 huggingface-hub>=0.17.0
 
 # === Performance & Efficiency ===
-# These should be installed after PyTorch to ensure CUDA compatibility.
 safetensors>=0.4.0
 bitsandbytes>=0.41.0
-# For flash-attn, it's best to run this in a notebook cell:
-# pip install flash-attn --no-build-isolation
-flash-attn>=2.3.0
-xformers>=0.0.22
+xformers>=0.0.22  # Added here
 deepspeed>=0.11.0
 
 # === Vedic & Indic Language Processing ===
-# Specific libraries for your project's domain.
 sentencepiece>=0.1.99
 indic-transliteration>=2.3.43
 aksharamukha>=2.1.1
 pyicu>=2.11
-polyglot>=16.7.4
+polyglot>=16.7.4  # Added here
 
 # === Experiment Tracking & Utilities ===
-# For logging, configuration, and progress bars.
 wandb>=0.15.0
 pyyaml>=6.0
 tqdm>=4.66.0
 rich>=1.3.0
+colorlog # Added here
