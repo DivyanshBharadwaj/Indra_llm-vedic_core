@@ -1,6 +1,3 @@
-torch
-torchvision
-torchaudio
 transformers>=4.35.0
 tokenizers>=0.14.0
 datasets>=2.14.0
