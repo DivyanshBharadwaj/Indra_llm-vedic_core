@@ -208,20 +208,20 @@ class PretrainTrainer:
         while self.global_step < self.config.max_steps:
             epoch_loss = self._train_epoch()
             
-            # Validation
-            if self.val_loader and self.global_step % self.config.eval_steps == 0:
-                val_metrics = self._validate()
-                self.metrics_tracker.update(val_metrics, self.global_step)
-                
-                if self.wandb:
-                    self.wandb.log(val_metrics, step=self.global_step)
-            
-            # Save checkpoint
-            if self.global_step % self.config.save_steps == 0:
-                self._save_checkpoint()
+##            # Validation
+##            if self.val_loader and self.global_step % self.config.eval_steps == 0:
+##                val_metrics = self._validate()
+##                self.metrics_tracker.update(val_metrics, self.global_step)
+##                
+##                if self.wandb:
+##                    self.wandb.log(val_metrics, step=self.global_step)
+##            
+##            # Save checkpoint
+##            if self.global_step % self.config.save_steps == 0:
+##                self._save_checkpoint()
             
             # Update curriculum phase
-            self._update_curriculum_phase()
+##            self._update_curriculum_phase()
             
             self.epoch += 1
             
@@ -297,6 +297,21 @@ class PretrainTrainer:
                 self._log_metrics(loss)
             
             self.global_step += 1
+
+            # Update curriculum phase
+            self._update_curriculum_phase()
+
+            # Validation
+            if self.val_loader and self.global_step % self.config.eval_steps == 0:
+                val_metrics = self._validate()
+                self.metrics_tracker.update(val_metrics, self.global_step)
+                
+                if self.wandb:
+                    self.wandb.log(val_metrics, step=self.global_step)
+            
+            # Save checkpoint
+            if self.global_step % self.config.save_steps == 0:
+                self._save_checkpoint()
         
         return epoch_loss / max(num_batches, 1)
 
@@ -547,3 +562,4 @@ class PretrainTrainer:
         logging.info(f"Resumed from step {self.global_step}")
         
         return checkpoint_info
+
