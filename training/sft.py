@@ -203,13 +203,13 @@ class SFTTrainer:
             
             loss = outputs['loss']
             
-            # Add Vedic alignment loss if available
-            aux_losses = outputs.get('aux_losses', {})
-            vedic_alignment_loss = aux_losses.get('vedic_alignment_loss', 0.0)
+#             # Add Vedic alignment loss if available
+#             aux_losses = outputs.get('aux_losses', {})
+#             vedic_alignment_loss = aux_losses.get('vedic_alignment_loss', 0.0)
             
-##            if isinstance(vedic_alignment_loss, torch.Tensor):
-            if isinstance(vedic_alignment_loss, torch.Tensor) and not (torch.isnan(vedic_alignment_loss) or torch.isinf(vedic_alignment_loss)):
-                loss = loss + 0.1 * vedic_alignment_loss  # Small weight for SFT
+# ##            if isinstance(vedic_alignment_loss, torch.Tensor):
+#             if isinstance(vedic_alignment_loss, torch.Tensor) and not (torch.isnan(vedic_alignment_loss) or torch.isinf(vedic_alignment_loss)):
+#                 loss = loss + 0.1 * vedic_alignment_loss  # Small weight for SFT
             
             # Scale loss for gradient accumulation
             loss = loss / self.config.gradient_accumulation_steps
@@ -501,5 +501,6 @@ class SFTTrainer:
         results['response_rate'] = non_empty_count / max(len(response_lengths), 1)
         
         return results
+
 
 
