@@ -111,7 +111,7 @@ class INDRADataset(Dataset):
             # Assume HuggingFace dataset
             return 'hf'
     
-    REPLACE the old _load_data method in dataset.py with this one
+    ### REPLACE the old _load_data method in dataset.py with this one
     def _load_data(self):
         """Load data from all specified paths, correctly handling directories."""
         all_files_to_process = []
@@ -634,6 +634,7 @@ class InstructionDataset(INDRADataset):
             result = super().__getitem__(idx)
         
         return result
+
 
 
 
