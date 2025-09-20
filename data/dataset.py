@@ -69,7 +69,11 @@ class INDRADataset(Dataset):
         self.overlap_size = overlap_size
         self.min_length = min_length
         self.filter_languages = filter_languages
-        
+        self.index = self._build_index()
+        self.num_files_processed = len(set(item['file_path'] for item in self.index))
+
+        logging.info(f"Dataset initialized. Found {len(self.index)} examples across {self.num_files_processed} files.")
+
         # Load and process data
         self.examples = []
         self.num_files_processed = 0
@@ -634,6 +638,7 @@ class InstructionDataset(INDRADataset):
             result = super().__getitem__(idx)
         
         return result
+
 
 
 
