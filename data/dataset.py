@@ -111,59 +111,15 @@ class INDRADataset(Dataset):
             # Assume HuggingFace dataset
             return 'hf'
     
-    # REPLACE the old _load_data method in dataset.py with this one
-    # def _load_data(self):
-    #     """Load data from all specified paths, correctly handling directories."""
-    #     all_files_to_process = []
-        
-    #     # First, expand all directory paths into a list of files
-    #     for path in self.data_paths:
-    #         if os.path.isdir(path):
-    #             # Use glob to find all .txt, .json, .jsonl, and .csv files recursively
-    #             for ext in ['*.txt', '*.json', '*.jsonl', '*.csv']:
-    #                 all_files_to_process.extend(
-    #                     glob.glob(os.path.join(path, '**', ext), recursive=True)
-    #                 )
-    #         elif os.path.isfile(path):
-    #             all_files_to_process.append(path)
-        
-    #     if not all_files_to_process:
-    #         # Handle HuggingFace dataset names if no local files are found
-    #         if self.data_type == 'hf' or (self.data_type == 'auto' and not any(os.path.exists(p) for p in self.data_paths)):
-    #              for path in self.data_paths:
-    #                 try:
-    #                     self._load_hf_dataset(path)
-    #                 except Exception as e:
-    #                     logging.error(f"Error loading HuggingFace dataset {path}: {e}")
-    #         return # Exit if no files were found
-
-    #     # Now, process each file individually
-    #     for file_path in all_files_to_process:
-    #         if self.data_type == "auto":
-    #             # Detect type based on the specific file, not the original path
-    #             detected_type = self._detect_data_type(file_path)
-    #         else:
-    #             detected_type = self.data_type
-            
-    #         try:
-    #             if detected_type == 'txt':
-    #                 self._load_txt_file(file_path)
-    #             elif detected_type == 'json':
-    #                 self._load_json_file(file_path)
-    #             elif detected_type == 'csv':
-    #                 self._load_csv_file(file_path)
-    #             else:
-    #                 logging.warning(f"Skipping unsupported file type for {file_path}")
-    #         except Exception as e:
-    #             logging.error(f"Error loading file {file_path}: {e}")
-
-    # --- Replace the _load_data method with this ---
+    REPLACE the old _load_data method in dataset.py with this one
     def _load_data(self):
         """Load data from all specified paths, correctly handling directories."""
         all_files_to_process = []
         
+        # First, expand all directory paths into a list of files
         for path in self.data_paths:
             if os.path.isdir(path):
+                # Use glob to find all .txt, .json, .jsonl, and .csv files recursively
                 for ext in ['*.txt', '*.json', '*.jsonl', '*.csv']:
                     all_files_to_process.extend(
                         glob.glob(os.path.join(path, '**', ext), recursive=True)
@@ -171,24 +127,23 @@ class INDRADataset(Dataset):
             elif os.path.isfile(path):
                 all_files_to_process.append(path)
         
-        self.num_files_processed = len(all_files_to_process) # <-- ADD THIS LINE
-    
         if not all_files_to_process:
+            # Handle HuggingFace dataset names if no local files are found
             if self.data_type == 'hf' or (self.data_type == 'auto' and not any(os.path.exists(p) for p in self.data_paths)):
                  for path in self.data_paths:
                     try:
                         self._load_hf_dataset(path)
                     except Exception as e:
                         logging.error(f"Error loading HuggingFace dataset {path}: {e}")
-            return
-    
+            return # Exit if no files were found
+
+        # Now, process each file individually
         for file_path in all_files_to_process:
             if self.data_type == "auto":
+                # Detect type based on the specific file, not the original path
                 detected_type = self._detect_data_type(file_path)
             else:
                 detected_type = self.data_type
-
-            print(f"DEBUG: Processing '{file_path}' | Detected type: '{detected_type}'")
             
             try:
                 if detected_type == 'txt':
@@ -201,6 +156,51 @@ class INDRADataset(Dataset):
                     logging.warning(f"Skipping unsupported file type for {file_path}")
             except Exception as e:
                 logging.error(f"Error loading file {file_path}: {e}")
+
+    # # --- Replace the _load_data method with this ---
+    # def _load_data(self):
+    #     """Load data from all specified paths, correctly handling directories."""
+    #     all_files_to_process = []
+        
+    #     for path in self.data_paths:
+    #         if os.path.isdir(path):
+    #             for ext in ['*.txt', '*.json', '*.jsonl', '*.csv']:
+    #                 all_files_to_process.extend(
+    #                     glob.glob(os.path.join(path, '**', ext), recursive=True)
+    #                 )
+    #         elif os.path.isfile(path):
+    #             all_files_to_process.append(path)
+        
+    #     self.num_files_processed = len(all_files_to_process) # <-- ADD THIS LINE
+    
+    #     if not all_files_to_process:
+    #         if self.data_type == 'hf' or (self.data_type == 'auto' and not any(os.path.exists(p) for p in self.data_paths)):
+    #              for path in self.data_paths:
+    #                 try:
+    #                     self._load_hf_dataset(path)
+    #                 except Exception as e:
+    #                     logging.error(f"Error loading HuggingFace dataset {path}: {e}")
+    #         return
+    
+    #     for file_path in all_files_to_process:
+    #         if self.data_type == "auto":
+    #             detected_type = self._detect_data_type(file_path)
+    #         else:
+    #             detected_type = self.data_type
+
+    #         print(f"DEBUG: Processing '{file_path}' | Detected type: '{detected_type}'")
+            
+    #         try:
+    #             if detected_type == 'txt':
+    #                 self._load_txt_file(file_path)
+    #             elif detected_type == 'json':
+    #                 self._load_json_file(file_path)
+    #             elif detected_type == 'csv':
+    #                 self._load_csv_file(file_path)
+    #             else:
+    #                 logging.warning(f"Skipping unsupported file type for {file_path}")
+    #         except Exception as e:
+    #             logging.error(f"Error loading file {file_path}: {e}")
     
     def _load_txt_file(self, path: str):
         """Load plain text file."""
@@ -634,5 +634,6 @@ class InstructionDataset(INDRADataset):
             result = super().__getitem__(idx)
         
         return result
+
 
 
