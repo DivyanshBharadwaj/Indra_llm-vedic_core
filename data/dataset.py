@@ -187,6 +187,8 @@ class INDRADataset(Dataset):
                 detected_type = self._detect_data_type(file_path)
             else:
                 detected_type = self.data_type
+
+            print(f"DEBUG: Processing '{file_path}' | Detected type: '{detected_type}'")
             
             try:
                 if detected_type == 'txt':
@@ -632,4 +634,5 @@ class InstructionDataset(INDRADataset):
             result = super().__getitem__(idx)
         
         return result
+
 
