@@ -301,16 +301,19 @@ class PretrainTrainer:
             # Update curriculum phase
             self._update_curriculum_phase()
 
-            # Validation
-            if self.val_loader and self.global_step % self.config.eval_steps == 0:
+           # Validation
+            if self.val_loader and self.global_step > 0 and self.global_step % self.config.eval_steps == 0:
                 val_metrics = self._validate()
                 self.metrics_tracker.update(val_metrics, self.global_step)
+                
+                # --- ADD THIS LINE TO PRINT THE VALIDATION LOSS ---
+                log_info(f"Step {self.global_step}: val_loss={val_metrics['val_loss']:.4f}")
                 
                 if self.wandb:
                     self.wandb.log(val_metrics, step=self.global_step)
             
             # Save checkpoint
-            if self.global_step % self.config.save_steps == 0:
+            if self.global_step > 0 and self.global_step % self.config.save_steps == 0:
                 self._save_checkpoint()
         
         return epoch_loss / max(num_batches, 1)
@@ -562,4 +565,5 @@ class PretrainTrainer:
         logging.info(f"Resumed from step {self.global_step}")
         
         return checkpoint_info
+
 
