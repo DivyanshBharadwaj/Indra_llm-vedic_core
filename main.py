@@ -342,23 +342,42 @@ def create_datasets(args, tokenizer):
     train_dataset = None
     val_dataset = None
     
+    # if args.train_data:
+    #     if args.vedic_data:
+    #         # Create Vedic dataset
+    #         train_dataset = VedicDataset(
+    #             data_path=args.vedic_data,
+    #             tokenizer=tokenizer,
+    #             max_length=args.max_seq_length,
+    #             data_type=args.data_type,
+    #         )
+    #     else:
+    #         # Create standard dataset
+    #         train_dataset = INDRADataset(
+    #             data_path=args.train_data,
+    #             tokenizer=tokenizer,
+    #             max_length=args.max_seq_length,
+    #             data_type=args.data_type,
+    #         )
+
+    # --- START OF FIX ---
+    # Combine all training data paths into a single list
+    all_train_paths = []
     if args.train_data:
-        if args.vedic_data:
-            # Create Vedic dataset
-            train_dataset = VedicDataset(
-                data_path=args.vedic_data,
-                tokenizer=tokenizer,
-                max_length=args.max_seq_length,
-                data_type=args.data_type,
-            )
-        else:
-            # Create standard dataset
-            train_dataset = INDRADataset(
-                data_path=args.train_data,
-                tokenizer=tokenizer,
-                max_length=args.max_seq_length,
-                data_type=args.data_type,
-            )
+        all_train_paths.extend(args.train_data)
+    if args.vedic_data:
+        all_train_paths.extend(args.vedic_data)
+    
+    if all_train_paths:
+        # Create a single dataset object that includes all training files
+        # We use VedicDataset to ensure Vedic-specific processing is available
+        train_dataset = VedicDataset(
+            data_path=all_train_paths,
+            tokenizer=tokenizer,
+            max_length=args.max_seq_length,
+            data_type=args.data_type,
+        )
+    # --- END OF FIX ---
     
     if args.val_data:
         val_dataset = INDRADataset(
@@ -709,3 +728,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
