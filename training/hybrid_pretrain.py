@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from transformers import AutoModel, AutoTokenizer, AutoConfig
 
-from .trainer_utils import TrainerUtils, get_optimizer, get_scheduler, MetricsTracker
+from .trainer_utils import TrainerUtils, get_optimizer, get_scheduler, MetricsTracker, StreamingMetricsTracker
 from .pretrain import PretrainTrainer
 from model import INDRATransformer
 
@@ -717,3 +717,4 @@ class HybridPretrainTrainer(PretrainTrainer):
         
         self._last_log_time = current_time
         self._last_log_step = self.global_step
+
