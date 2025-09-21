@@ -339,9 +339,9 @@ class PretrainTrainer:
         if not self.val_loader:
             return {}
             
-        # 🧹 Clear memory before validation starts
-        gc.collect()
-        torch.cuda.empty_cache()
+        # # 🧹 Clear memory before validation starts
+        # gc.collect()
+        # torch.cuda.empty_cache()
     
         self.model.eval()
         
@@ -493,6 +493,7 @@ class PretrainTrainer:
         logging.info(f"Resumed from step {self.global_step}")
         
         return checkpoint_info
+
 
 
 
