@@ -31,6 +31,12 @@ class StreamingINDRADataset(IterableDataset):
     Processes data in configurable batch chunks (1-10MB) to minimize memory usage.
     """
     
+    def __len__(self):
+        """Return estimated dataset length based on files and batch size."""
+        # Rough estimate: assume average file size and examples per file
+        estimated_examples_per_file = max(1, self.examples_per_batch // 10)
+        return self.total_files * estimated_examples_per_file
+    
     def __init__(
         self,
         data_path: Union[str, List[str]],
@@ -496,6 +502,12 @@ class StreamingINDRADataset(IterableDataset):
 class StreamingVedicDataset(StreamingINDRADataset):
     """Streaming version of VedicDataset for memory-efficient Vedic text processing."""
     
+    def __len__(self):
+        """Return estimated dataset length based on files and batch size."""
+        # Vedic texts might have different density, but use same estimation
+        estimated_examples_per_file = max(1, self.examples_per_batch // 8)  # Slightly higher for Vedic
+        return self.total_files * estimated_examples_per_file
+    
     def __init__(
         self,
         data_path: Union[str, List[str]],
@@ -575,6 +587,12 @@ class StreamingVedicDataset(StreamingINDRADataset):
 
 class StreamingInstructionDataset(StreamingINDRADataset):
     """Streaming version of InstructionDataset for memory-efficient instruction tuning."""
+    
+    def __len__(self):
+        """Return estimated dataset length based on files and batch size."""
+        # Instruction datasets typically have fewer examples per file
+        estimated_examples_per_file = max(1, self.examples_per_batch // 20)
+        return self.total_files * estimated_examples_per_file
     
     def __init__(
         self,
