@@ -1,6 +1,7 @@
 """
-Dataset classes for INDRA LLM with support for multiple formats and languages
-(c) Divyansh Bharadwaj
+Streaming Dataset classes for INDRA LLM with support for multiple formats and languages
+Memory-efficient streaming implementation with configurable batch sizes
+(c) Divyansh Bharadwaj - Modified for streaming support
 """
 
 import os
@@ -8,21 +9,26 @@ import glob
 import json
 import logging
 import random
-from typing import List, Dict, Optional, Union, Iterator, Tuple
+import pickle
+import hashlib
+from typing import List, Dict, Optional, Union, Iterator, Tuple, Generator
 from pathlib import Path
+import gc
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
 import pandas as pd
 from datasets import load_dataset, Dataset as HFDataset
 
-class INDRADataset(Dataset):
+class StreamingINDRADataset(IterableDataset):
     """
-    Base dataset class supporting multiple data formats:
+    Memory-efficient streaming dataset class supporting multiple data formats:
     - .txt files (raw text)
     - .json files (structured data)
     - .csv files (tabular data)
     - HuggingFace datasets
+    
+    Processes data in configurable batch chunks (1-10MB) to minimize memory usage.
     """
     
     def __init__(
@@ -39,9 +45,13 @@ class INDRADataset(Dataset):
         overlap_size: int = 128,
         min_length: int = 10,
         filter_languages: Optional[List[str]] = None,
+        batch_size_mb: float = 5.0,  # Memory batch size in MB
+        cache_dir: Optional[str] = None,
+        shuffle_buffer_size: int = 1000,
+        prefetch_factor: int = 2,
     ):
         """
-        Initialize INDRA dataset.
+        Initialize streaming INDRA dataset.
         
         Args:
             data_path: Path to data file(s) or HuggingFace dataset name
@@ -56,6 +66,10 @@ class INDRADataset(Dataset):
             overlap_size: Overlap between chunks
             min_length: Minimum text length to include
             filter_languages: List of languages to include
+            batch_size_mb: Target batch size in MB for memory management
+            cache_dir: Directory for caching processed chunks
+            shuffle_buffer_size: Size of shuffle buffer
+            prefetch_factor: Number of batches to prefetch
         """
         self.data_paths = [data_path] if isinstance(data_path, str) else data_path
         self.tokenizer = tokenizer
@@ -69,201 +83,307 @@ class INDRADataset(Dataset):
         self.overlap_size = overlap_size
         self.min_length = min_length
         self.filter_languages = filter_languages
+        self.batch_size_mb = batch_size_mb
+        self.cache_dir = cache_dir
+        self.shuffle_buffer_size = shuffle_buffer_size
+        self.prefetch_factor = prefetch_factor
         
-        # Load and process data
-        self.examples = []
-        self._load_data()
-
-        # Wrap examples in a HuggingFace dataset for map/filter support
-        if len(self.examples) > 0:
-            self.hf_dataset = HFDataset.from_list(self.examples)
-        else:
-            self.hf_dataset = HFDataset.from_list([])
-
-        logging.info(f"Loaded {len(self.examples)} examples from {len(self.data_paths)} files")
-
+        # Calculate approximate batch size in number of examples
+        # Rough estimate: 1 token ≈ 4 bytes, average text ≈ max_length/2 tokens
+        avg_tokens_per_example = max_length // 2
+        bytes_per_example = avg_tokens_per_example * 4 * 2  # 2x for safety margin
+        self.examples_per_batch = max(1, int((batch_size_mb * 1024 * 1024) // bytes_per_example))
+        
+        # Setup cache directory
+        if self.cache_dir:
+            os.makedirs(self.cache_dir, exist_ok=True)
+        
+        # File tracking
+        self.file_list = self._build_file_list()
+        self.total_files = len(self.file_list)
+        
+        # Shuffle buffer
+        self._shuffle_buffer = []
+        
+        logging.info(f"Initialized streaming dataset with {self.total_files} files")
+        logging.info(f"Target batch size: {self.examples_per_batch} examples (~{batch_size_mb}MB)")
+    
+    def _build_file_list(self) -> List[Tuple[str, str]]:
+        """Build list of all files to process with their detected types."""
+        all_files = []
+        
+        for path in self.data_paths:
+            if os.path.isdir(path):
+                # Find all supported files recursively
+                for ext in ['*.txt', '*.json', '*.jsonl', '*.csv']:
+                    all_files.extend([
+                        (f, self._detect_data_type(f))
+                        for f in glob.glob(os.path.join(path, '**', ext), recursive=True)
+                    ])
+            elif os.path.isfile(path):
+                all_files.append((path, self._detect_data_type(path)))
+            else:
+                # Assume HuggingFace dataset
+                all_files.append((path, 'hf'))
+        
+        return all_files
     
     def _detect_data_type(self, path: str) -> str:
         """Auto-detect data type from file extension or content."""
-        if os.path.isfile(path):
-            ext = Path(path).suffix.lower()
-            if ext == '.txt':
-                return 'txt'
-            elif ext == '.json' or ext == '.jsonl':
-                return 'json'
-            elif ext == '.csv':
-                return 'csv'
-            else:
-                # Try to detect from content
-                try:
-                    with open(path, 'r', encoding='utf-8') as f:
-                        first_line = f.readline().strip()
-                        if first_line.startswith('{'):
-                            return 'json'
-                        elif ',' in first_line and '"' in first_line:
-                            return 'csv'
-                        else:
-                            return 'txt'
-                except Exception:
-                    return 'txt'
-        else:
-            # Assume HuggingFace dataset
+        if not os.path.isfile(path):
             return 'hf'
-    
-    # REPLACE the old _load_data method in dataset.py with this one
-    def _load_data(self):
-        """Load data from all specified paths, correctly handling directories."""
-        all_files_to_process = []
-        
-        # First, expand all directory paths into a list of files
-        for path in self.data_paths:
-            if os.path.isdir(path):
-                # Use glob to find all .txt, .json, .jsonl, and .csv files recursively
-                for ext in ['*.txt', '*.json', '*.jsonl', '*.csv']:
-                    all_files_to_process.extend(
-                        glob.glob(os.path.join(path, '**', ext), recursive=True)
-                    )
-            elif os.path.isfile(path):
-                all_files_to_process.append(path)
-        
-        if not all_files_to_process:
-            # Handle HuggingFace dataset names if no local files are found
-            if self.data_type == 'hf' or (self.data_type == 'auto' and not any(os.path.exists(p) for p in self.data_paths)):
-                 for path in self.data_paths:
-                    try:
-                        self._load_hf_dataset(path)
-                    except Exception as e:
-                        logging.error(f"Error loading HuggingFace dataset {path}: {e}")
-            return # Exit if no files were found
-
-        # Now, process each file individually
-        for file_path in all_files_to_process:
-            if self.data_type == "auto":
-                # Detect type based on the specific file, not the original path
-                detected_type = self._detect_data_type(file_path)
-            else:
-                detected_type = self.data_type
             
-            try:
-                if detected_type == 'txt':
-                    self._load_txt_file(file_path)
-                elif detected_type == 'json':
-                    self._load_json_file(file_path)
-                elif detected_type == 'csv':
-                    self._load_csv_file(file_path)
-                else:
-                    logging.warning(f"Skipping unsupported file type for {file_path}")
-            except Exception as e:
-                logging.error(f"Error loading file {file_path}: {e}")
-    
-    def _load_txt_file(self, path: str):
-        """Load plain text file."""
-        with open(path, 'r', encoding='utf-8') as f:
-            content = f.read().strip()
-        
-        if self.split_documents and len(content) > self.chunk_size:
-            # Split into overlapping chunks
-            chunks = self._split_text(content)
-            for chunk in chunks:
-                if len(chunk.strip()) >= self.min_length:
-                    self.examples.append({'text': chunk.strip()})
+        ext = Path(path).suffix.lower()
+        if ext in ['.txt']:
+            return 'txt'
+        elif ext in ['.json', '.jsonl']:
+            return 'json'
+        elif ext in ['.csv']:
+            return 'csv'
         else:
-            if len(content.strip()) >= self.min_length:
-                self.examples.append({'text': content.strip()})
-    
-    def _load_json_file(self, path: str):
-        """Load JSON or JSONL file."""
-        with open(path, 'r', encoding='utf-8') as f:
-            # Try to load as single JSON object first
+            # Try to detect from content
             try:
-                f.seek(0)
-                data = json.load(f)
-                if isinstance(data, list):
-                    for item in data:
-                        self._process_json_item(item)
-                elif isinstance(data, dict):
-                    self._process_json_item(data)
-            except json.JSONDecodeError:
-                # Try as JSONL
-                f.seek(0)
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            item = json.loads(line)
-                            self._process_json_item(item)
-                        except json.JSONDecodeError as e:
-                            logging.warning(f"Skipping invalid JSON line: {line[:100]}...")
+                with open(path, 'r', encoding='utf-8') as f:
+                    first_line = f.readline().strip()
+                    if first_line.startswith('{'):
+                        return 'json'
+                    elif ',' in first_line and '"' in first_line:
+                        return 'csv'
+                    else:
+                        return 'txt'
+            except Exception:
+                return 'txt'
     
-    def _process_json_item(self, item: Dict):
-        """Process a single JSON item."""
-        if isinstance(item, dict):
-            # Extract text based on expected columns
-            if self.instruction_column and self.response_column:
-                # Instruction-response format
-                if self.instruction_column in item and self.response_column in item:
-                    instruction = item[self.instruction_column].strip()
-                    response = item[self.response_column].strip()
-                    if instruction and response:
-                        self.examples.append({
-                            'instruction': instruction,
-                            'response': response,
-                            'text': f"{instruction}\n{response}"
-                        })
-            elif self.text_column in item:
-                # Simple text format
-                text = item[self.text_column].strip()
-                if len(text) >= self.min_length:
-                    processed_item = {'text': text}
-                    # Copy other fields
-                    for key, value in item.items():
-                        if key != self.text_column:
-                            processed_item[key] = value
-                    self.examples.append(processed_item)
-            else:
-                # Try common text fields
-                for field in ['text', 'content', 'body', 'message']:
-                    if field in item:
-                        text = str(item[field]).strip()
-                        if len(text) >= self.min_length:
-                            self.examples.append({'text': text})
-                        break
+    def _get_cache_path(self, file_path: str) -> Optional[str]:
+        """Get cache file path for a given input file."""
+        if not self.cache_dir:
+            return None
+        
+        # Create hash of file path + modification time for cache key
+        stat = os.stat(file_path) if os.path.exists(file_path) else None
+        cache_key = hashlib.md5(
+            f"{file_path}_{stat.st_mtime if stat else 0}_{self.max_length}_{self.chunk_size}".encode()
+        ).hexdigest()
+        
+        return os.path.join(self.cache_dir, f"{cache_key}.pkl")
     
-    def _load_csv_file(self, path: str):
-        """Load CSV file."""
+    def _load_from_cache(self, cache_path: str) -> Optional[List[Dict]]:
+        """Load processed examples from cache."""
         try:
-            df = pd.read_csv(path)
-            for _, row in df.iterrows():
-                self._process_json_item(row.to_dict())
+            with open(cache_path, 'rb') as f:
+                return pickle.load(f)
         except Exception as e:
-            logging.error(f"Error loading CSV {path}: {e}")
+            logging.debug(f"Cache miss for {cache_path}: {e}")
+            return None
     
-    def _load_hf_dataset(self, dataset_name: str):
-        """Load HuggingFace dataset."""
+    def _save_to_cache(self, cache_path: str, examples: List[Dict]):
+        """Save processed examples to cache."""
+        try:
+            with open(cache_path, 'wb') as f:
+                pickle.dump(examples, f)
+        except Exception as e:
+            logging.warning(f"Failed to save cache {cache_path}: {e}")
+    
+    def _stream_file_batches(self, file_path: str, file_type: str) -> Generator[List[Dict], None, None]:
+        """Stream batches of examples from a single file."""
+        cache_path = self._get_cache_path(file_path)
+        
+        # Try loading from cache first
+        if cache_path and os.path.exists(cache_path):
+            cached_examples = self._load_from_cache(cache_path)
+            if cached_examples:
+                # Yield cached examples in batches
+                for i in range(0, len(cached_examples), self.examples_per_batch):
+                    batch = cached_examples[i:i + self.examples_per_batch]
+                    yield batch
+                return
+        
+        # Process file and collect examples for caching
+        all_examples = []
+        current_batch = []
+        
+        try:
+            if file_type == 'txt':
+                for example in self._stream_txt_file(file_path):
+                    current_batch.append(example)
+                    all_examples.append(example)
+                    
+                    if len(current_batch) >= self.examples_per_batch:
+                        yield current_batch
+                        current_batch = []
+                        
+            elif file_type == 'json':
+                for example in self._stream_json_file(file_path):
+                    current_batch.append(example)
+                    all_examples.append(example)
+                    
+                    if len(current_batch) >= self.examples_per_batch:
+                        yield current_batch
+                        current_batch = []
+                        
+            elif file_type == 'csv':
+                for example in self._stream_csv_file(file_path):
+                    current_batch.append(example)
+                    all_examples.append(example)
+                    
+                    if len(current_batch) >= self.examples_per_batch:
+                        yield current_batch
+                        current_batch = []
+                        
+            elif file_type == 'hf':
+                for example in self._stream_hf_dataset(file_path):
+                    current_batch.append(example)
+                    all_examples.append(example)
+                    
+                    if len(current_batch) >= self.examples_per_batch:
+                        yield current_batch
+                        current_batch = []
+                        
+            # Yield remaining examples
+            if current_batch:
+                yield current_batch
+                
+            # Cache all examples
+            if cache_path and all_examples:
+                self._save_to_cache(cache_path, all_examples)
+                
+        except Exception as e:
+            logging.error(f"Error streaming file {file_path}: {e}")
+        
+        # Clean up memory
+        del all_examples
+        gc.collect()
+    
+    def _stream_txt_file(self, path: str) -> Generator[Dict, None, None]:
+        """Stream examples from a text file."""
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            if self.split_documents and len(content) > self.chunk_size:
+                chunks = self._split_text(content)
+                for chunk in chunks:
+                    if len(chunk.strip()) >= self.min_length:
+                        yield {'text': chunk.strip()}
+            else:
+                if len(content.strip()) >= self.min_length:
+                    yield {'text': content.strip()}
+                    
+        except Exception as e:
+            logging.error(f"Error reading text file {path}: {e}")
+    
+    def _stream_json_file(self, path: str) -> Generator[Dict, None, None]:
+        """Stream examples from a JSON/JSONL file."""
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                # Try single JSON first
+                try:
+                    f.seek(0)
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        for item in data:
+                            processed = self._process_json_item(item)
+                            if processed:
+                                yield processed
+                    elif isinstance(data, dict):
+                        processed = self._process_json_item(data)
+                        if processed:
+                            yield processed
+                            
+                except json.JSONDecodeError:
+                    # Try JSONL
+                    f.seek(0)
+                    for line_num, line in enumerate(f):
+                        line = line.strip()
+                        if line:
+                            try:
+                                item = json.loads(line)
+                                processed = self._process_json_item(item)
+                                if processed:
+                                    yield processed
+                            except json.JSONDecodeError:
+                                logging.warning(f"Skipping invalid JSON line {line_num} in {path}")
+                                
+        except Exception as e:
+            logging.error(f"Error reading JSON file {path}: {e}")
+    
+    def _stream_csv_file(self, path: str) -> Generator[Dict, None, None]:
+        """Stream examples from a CSV file in chunks."""
+        try:
+            # Read CSV in chunks to manage memory
+            chunk_size = max(100, self.examples_per_batch)
+            for chunk_df in pd.read_csv(path, chunksize=chunk_size):
+                for _, row in chunk_df.iterrows():
+                    processed = self._process_json_item(row.to_dict())
+                    if processed:
+                        yield processed
+                        
+        except Exception as e:
+            logging.error(f"Error reading CSV file {path}: {e}")
+    
+    def _stream_hf_dataset(self, dataset_name: str) -> Generator[Dict, None, None]:
+        """Stream examples from a HuggingFace dataset."""
         try:
             # Try loading with different splits
+            dataset = None
             for split in ['train', 'validation', 'test']:
                 try:
-                    dataset = load_dataset(dataset_name, split=split)
-                    for item in dataset:
-                        self._process_json_item(item)
+                    dataset = load_dataset(dataset_name, split=split, streaming=True)
                     break
                 except Exception:
                     continue
-            else:
+            
+            if dataset is None:
                 # Try loading without split
-                dataset = load_dataset(dataset_name)
-                if isinstance(dataset, dict):
-                    # Multiple splits
-                    for split_name, split_data in dataset.items():
-                        for item in split_data:
-                            self._process_json_item(item)
-                else:
-                    # Single dataset
-                    for item in dataset:
-                        self._process_json_item(item)
+                dataset = load_dataset(dataset_name, streaming=True)
+                
+            # Stream examples
+            if hasattr(dataset, '__iter__'):
+                for item in dataset:
+                    processed = self._process_json_item(item)
+                    if processed:
+                        yield processed
+                        
         except Exception as e:
-            logging.error(f"Error loading HuggingFace dataset {dataset_name}: {e}")
+            logging.error(f"Error streaming HuggingFace dataset {dataset_name}: {e}")
+    
+    def _process_json_item(self, item: Dict) -> Optional[Dict]:
+        """Process a single JSON item and return processed example or None."""
+        if not isinstance(item, dict):
+            return None
+            
+        # Handle instruction-response format
+        if self.instruction_column and self.response_column:
+            if self.instruction_column in item and self.response_column in item:
+                instruction = str(item[self.instruction_column]).strip()
+                response = str(item[self.response_column]).strip()
+                if instruction and response and len(instruction + response) >= self.min_length:
+                    return {
+                        'instruction': instruction,
+                        'response': response,
+                        'text': f"{instruction}\n{response}"
+                    }
+                    
+        # Handle simple text format
+        elif self.text_column in item:
+            text = str(item[self.text_column]).strip()
+            if len(text) >= self.min_length:
+                processed_item = {'text': text}
+                # Copy other fields
+                for key, value in item.items():
+                    if key != self.text_column:
+                        processed_item[key] = value
+                return processed_item
+                
+        # Try common text fields
+        else:
+            for field in ['text', 'content', 'body', 'message']:
+                if field in item:
+                    text = str(item[field]).strip()
+                    if len(text) >= self.min_length:
+                        return {'text': text}
+                        
+        return None
     
     def _split_text(self, text: str) -> List[str]:
         """Split long text into overlapping chunks."""
@@ -277,17 +397,14 @@ class INDRADataset(Dataset):
             end = start + self.chunk_size
             
             if end >= len(text):
-                # Last chunk
                 chunks.append(text[start:])
                 break
             
-            # Try to find a good breaking point (sentence end, paragraph break)
+            # Find good breaking point
             chunk = text[start:end]
-            
-            # Look for sentence boundaries in the last part of the chunk
             for delimiter in ['\n\n', '\n', '. ', '! ', '? ']:
                 last_pos = chunk.rfind(delimiter)
-                if last_pos > self.chunk_size // 2:  # Don't break too early
+                if last_pos > self.chunk_size // 2:
                     chunk = text[start:start + last_pos + len(delimiter)]
                     break
             
@@ -296,52 +413,88 @@ class INDRADataset(Dataset):
         
         return chunks
     
-    def __len__(self) -> int:
-        return len(self.hf_dataset)
+    def _shuffle_buffer_add(self, examples: List[Dict]):
+        """Add examples to shuffle buffer."""
+        self._shuffle_buffer.extend(examples)
+        
+        # If buffer is full, shuffle and yield some examples
+        if len(self._shuffle_buffer) >= self.shuffle_buffer_size:
+            random.shuffle(self._shuffle_buffer)
+            # Yield half the buffer
+            yield_count = len(self._shuffle_buffer) // 2
+            for i in range(yield_count):
+                yield self._shuffle_buffer.pop(0)
     
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Get a single example."""
-        example = self.hf_dataset[idx]
+    def _flush_shuffle_buffer(self):
+        """Flush remaining examples from shuffle buffer."""
+        random.shuffle(self._shuffle_buffer)
+        while self._shuffle_buffer:
+            yield self._shuffle_buffer.pop(0)
+    
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        """Iterate over dataset examples."""
+        # Shuffle files for each epoch
+        files_to_process = self.file_list.copy()
+        random.shuffle(files_to_process)
         
-        # Tokenize text
-        text = example['text']
-        encoding = self.tokenizer(
-            text,
-            max_length=self.max_length,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
-        
-        result = {
-            'input_ids': encoding['input_ids'].squeeze(0),
-            'attention_mask': encoding['attention_mask'].squeeze(0),
-            'labels': encoding['input_ids'].squeeze(0).clone(),
-        }
-        
-        # Add any additional fields
-        for key, value in example.items():
-            if key not in ['text'] and not key.startswith('_'):
-                result[key] = value
-        
-        return result
+        try:
+            for file_path, file_type in files_to_process:
+                # Stream batches from this file
+                for batch in self._stream_file_batches(file_path, file_type):
+                    # Add to shuffle buffer and yield when ready
+                    for example in self._shuffle_buffer_add(batch):
+                        # Tokenize and yield
+                        tokenized = self._tokenize_example(example)
+                        if tokenized:
+                            yield tokenized
+                    
+                    # Clean up memory after each batch
+                    gc.collect()
+            
+            # Flush remaining examples
+            for example in self._flush_shuffle_buffer():
+                tokenized = self._tokenize_example(example)
+                if tokenized:
+                    yield tokenized
+                    
+        except Exception as e:
+            logging.error(f"Error in dataset iteration: {e}")
+    
+    def _tokenize_example(self, example: Dict) -> Optional[Dict[str, torch.Tensor]]:
+        """Tokenize a single example."""
+        try:
+            text = example.get('text', '')
+            if not text:
+                return None
+            
+            encoding = self.tokenizer(
+                text,
+                max_length=self.max_length,
+                padding='max_length',
+                truncation=True,
+                return_tensors='pt'
+            )
+            
+            result = {
+                'input_ids': encoding['input_ids'].squeeze(0),
+                'attention_mask': encoding['attention_mask'].squeeze(0),
+                'labels': encoding['input_ids'].squeeze(0).clone(),
+            }
+            
+            # Add metadata
+            for key, value in example.items():
+                if key not in ['text'] and not key.startswith('_'):
+                    result[key] = value
+            
+            return result
+            
+        except Exception as e:
+            logging.error(f"Error tokenizing example: {e}")
+            return None
 
-    # Allow HuggingFace-style operations (map, filter, shuffle, etc.)
-    def map(self, *args, **kwargs):
-        self.hf_dataset = self.hf_dataset.map(*args, **kwargs)
-        return self
 
-    def filter(self, *args, **kwargs):
-        self.hf_dataset = self.hf_dataset.filter(*args, **kwargs)
-        return self
-
-    def shuffle(self, *args, **kwargs):
-        self.hf_dataset = self.hf_dataset.shuffle(*args, **kwargs)
-        return self
-
-
-class VedicDataset(INDRADataset):
-    """Specialized dataset for Vedic texts with enhanced processing."""
+class StreamingVedicDataset(StreamingINDRADataset):
+    """Streaming version of VedicDataset for memory-efficient Vedic text processing."""
     
     def __init__(
         self,
@@ -352,157 +505,76 @@ class VedicDataset(INDRADataset):
         add_vedic_markers: bool = True,
         **kwargs
     ):
-        """
-        Initialize Vedic dataset.
-        
-        Args:
-            data_path: Path to Vedic text files
-            tokenizer: VedicTokenizer instance
-            vedic_weight: Sampling weight for Vedic content
-            preserve_structure: Whether to preserve verse structure
-            add_vedic_markers: Whether to add Vedic content markers
-            **kwargs: Additional arguments for base dataset
-        """
         self.vedic_weight = vedic_weight
         self.preserve_structure = preserve_structure
         self.add_vedic_markers = add_vedic_markers
         
         super().__init__(data_path, tokenizer, **kwargs)
     
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Get a single Vedic example with enhanced processing."""
-        example = self.examples[idx]
-        text = example['text']
-        
-        # Use Vedic tokenizer's specialized encoding if available
-        if hasattr(self.tokenizer, 'encode_vedic_text'):
-            token_ids = self.tokenizer.encode_vedic_text(
-                text,
-                add_vedic_markers=self.add_vedic_markers,
-                preserve_structure=self.preserve_structure,
-                max_length=self.max_length,
-                padding='max_length',
-                truncation=True,
-            )
+    def _tokenize_example(self, example: Dict) -> Optional[Dict[str, torch.Tensor]]:
+        """Tokenize with Vedic-specific processing."""
+        try:
+            text = example.get('text', '')
+            if not text:
+                return None
             
-            # Convert to tensors
-            input_ids = torch.tensor(token_ids, dtype=torch.long)
-            attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
-            
-            # Create Vedic attention weights if supported
-            if hasattr(self.tokenizer, 'create_vedic_attention_mask'):
-                vedic_weights = torch.tensor(
-                    self.tokenizer.create_vedic_attention_mask(token_ids),
-                    dtype=torch.float
+            # Use Vedic tokenizer if available
+            if hasattr(self.tokenizer, 'encode_vedic_text'):
+                token_ids = self.tokenizer.encode_vedic_text(
+                    text,
+                    add_vedic_markers=self.add_vedic_markers,
+                    preserve_structure=self.preserve_structure,
+                    max_length=self.max_length,
+                    padding='max_length',
+                    truncation=True,
                 )
+                
+                input_ids = torch.tensor(token_ids, dtype=torch.long)
+                attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
+                
+                if hasattr(self.tokenizer, 'create_vedic_attention_mask'):
+                    vedic_weights = torch.tensor(
+                        self.tokenizer.create_vedic_attention_mask(token_ids),
+                        dtype=torch.float
+                    )
+                else:
+                    vedic_weights = torch.ones_like(attention_mask, dtype=torch.float) * self.vedic_weight
+                    
             else:
-                vedic_weights = torch.ones_like(attention_mask, dtype=torch.float)
-        else:
-            # Fall back to standard tokenization
-            encoding = self.tokenizer(
-                text,
-                max_length=self.max_length,
-                padding='max_length',
-                truncation=True,
-                return_tensors='pt'
-            )
-            input_ids = encoding['input_ids'].squeeze(0)
-            attention_mask = encoding['attention_mask'].squeeze(0)
-            vedic_weights = torch.ones_like(attention_mask, dtype=torch.float) * self.vedic_weight
-        
-        result = {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'labels': input_ids.clone(),
-            'vedic_weights': vedic_weights,
-            'is_vedic': torch.tensor(1, dtype=torch.long),
-        }
-        
-        # Add metadata
-        for key, value in example.items():
-            if key not in ['text'] and not key.startswith('_'):
-                result[key] = value
-        
-        return result
+                # Fall back to standard tokenization
+                encoding = self.tokenizer(
+                    text,
+                    max_length=self.max_length,
+                    padding='max_length',
+                    truncation=True,
+                    return_tensors='pt'
+                )
+                input_ids = encoding['input_ids'].squeeze(0)
+                attention_mask = encoding['attention_mask'].squeeze(0)
+                vedic_weights = torch.ones_like(attention_mask, dtype=torch.float) * self.vedic_weight
+            
+            result = {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+                'labels': input_ids.clone(),
+                'vedic_weights': vedic_weights,
+                'is_vedic': torch.tensor(1, dtype=torch.long),
+            }
+            
+            # Add metadata
+            for key, value in example.items():
+                if key not in ['text'] and not key.startswith('_'):
+                    result[key] = value
+            
+            return result
+            
+        except Exception as e:
+            logging.error(f"Error tokenizing Vedic example: {e}")
+            return None
 
-class MultiLanguageDataset(INDRADataset):
-    """Dataset for handling multiple languages with appropriate sampling."""
-    
-    def __init__(
-        self,
-        data_configs: List[Dict],
-        tokenizer,
-        sampling_weights: Optional[Dict[str, float]] = None,
-        **kwargs
-    ):
-        """
-        Initialize multi-language dataset.
-        
-        Args:
-            data_configs: List of data configuration dicts with 'path' and 'language'
-            tokenizer: Tokenizer instance
-            sampling_weights: Sampling weights for different languages
-            **kwargs: Additional arguments for base dataset
-        """
-        self.data_configs = data_configs
-        self.sampling_weights = sampling_weights or {}
-        
-        # Initialize with empty examples
-        self.tokenizer = tokenizer
-        self.max_length = kwargs.get('max_length', 2048)
-        self.examples = []
-        self.language_indices = {}  # Track which examples belong to which language
-        
-        # Load data from all configurations
-        for config in data_configs:
-            lang = config.get('language', 'unknown')
-            start_idx = len(self.examples)
-            
-            # Create temporary dataset for this language
-            temp_dataset = INDRADataset(
-                data_path=config['path'],
-                tokenizer=tokenizer,
-                **{k: v for k, v in kwargs.items() if k not in ['data_path']}
-            )
-            
-            # Add language info to examples
-            for example in temp_dataset.examples:
-                example['language'] = lang
-                self.examples.append(example)
-            
-            end_idx = len(self.examples)
-            self.language_indices[lang] = list(range(start_idx, end_idx))
-        
-        logging.info(f"Loaded multi-language dataset with {len(self.examples)} examples")
-        for lang, indices in self.language_indices.items():
-            logging.info(f"  {lang}: {len(indices)} examples")
-    
-    def get_language_statistics(self) -> Dict[str, int]:
-        """Get statistics about language distribution."""
-        return {lang: len(indices) for lang, indices in self.language_indices.items()}
-    
-    def sample_by_language(self, batch_size: int) -> List[int]:
-        """Sample indices with language-aware weighting."""
-        if not self.sampling_weights:
-            # Uniform sampling
-            return random.choices(range(len(self.examples)), k=batch_size)
-        
-        # Weighted sampling
-        indices = []
-        for _ in range(batch_size):
-            # Choose language based on weights
-            languages = list(self.language_indices.keys())
-            weights = [self.sampling_weights.get(lang, 1.0) for lang in languages]
-            chosen_lang = random.choices(languages, weights=weights, k=1)[0]
-            
-            # Choose random example from chosen language
-            lang_indices = self.language_indices[chosen_lang]
-            indices.append(random.choice(lang_indices))
-        
-        return indices
 
-class InstructionDataset(INDRADataset):
-    """Dataset for instruction-following fine-tuning."""
+class StreamingInstructionDataset(StreamingINDRADataset):
+    """Streaming version of InstructionDataset for memory-efficient instruction tuning."""
     
     def __init__(
         self,
@@ -512,16 +584,6 @@ class InstructionDataset(INDRADataset):
         response_loss_only: bool = True,
         **kwargs
     ):
-        """
-        Initialize instruction dataset.
-        
-        Args:
-            data_path: Path to instruction data
-            tokenizer: Tokenizer instance
-            instruction_template: Template for formatting instruction-response pairs
-            response_loss_only: Whether to compute loss only on response tokens
-            **kwargs: Additional arguments for base dataset
-        """
         self.instruction_template = instruction_template
         self.response_loss_only = response_loss_only
         
@@ -533,58 +595,95 @@ class InstructionDataset(INDRADataset):
             **kwargs
         )
     
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """Get a single instruction-response example."""
-        example = self.examples[idx]
-        
-        if 'instruction' in example and 'response' in example:
-            # Format with template
-            formatted_text = self.instruction_template.format(
-                instruction=example['instruction'],
-                response=example['response']
-            )
-            
-            # Tokenize full text
-            full_encoding = self.tokenizer(
-                formatted_text,
-                max_length=self.max_length,
-                padding='max_length',
-                truncation=True,
-                return_tensors='pt'
-            )
-            
-            input_ids = full_encoding['input_ids'].squeeze(0)
-            attention_mask = full_encoding['attention_mask'].squeeze(0)
-            
-            if self.response_loss_only:
-                # Create labels that ignore instruction tokens
-                instruction_text = self.instruction_template.format(
+    def _tokenize_example(self, example: Dict) -> Optional[Dict[str, torch.Tensor]]:
+        """Tokenize instruction-response example."""
+        try:
+            if 'instruction' in example and 'response' in example:
+                # Format with template
+                formatted_text = self.instruction_template.format(
                     instruction=example['instruction'],
-                    response=""
-                ).rstrip()
+                    response=example['response']
+                )
                 
-                instruction_encoding = self.tokenizer(
-                    instruction_text,
-                    add_special_tokens=False,
+                # Tokenize full text
+                full_encoding = self.tokenizer(
+                    formatted_text,
+                    max_length=self.max_length,
+                    padding='max_length',
+                    truncation=True,
                     return_tensors='pt'
                 )
                 
-                instruction_length = instruction_encoding['input_ids'].size(1)
+                input_ids = full_encoding['input_ids'].squeeze(0)
+                attention_mask = full_encoding['attention_mask'].squeeze(0)
                 
-                # Create labels (ignore instruction, predict response)
-                labels = input_ids.clone()
-                labels[:instruction_length] = -100  # Ignore instruction tokens
+                if self.response_loss_only:
+                    # Create labels that ignore instruction tokens
+                    instruction_text = self.instruction_template.format(
+                        instruction=example['instruction'],
+                        response=""
+                    ).rstrip()
+                    
+                    instruction_encoding = self.tokenizer(
+                        instruction_text,
+                        add_special_tokens=False,
+                        return_tensors='pt'
+                    )
+                    
+                    instruction_length = instruction_encoding['input_ids'].size(1)
+                    
+                    # Create labels (ignore instruction, predict response)
+                    labels = input_ids.clone()
+                    labels[:instruction_length] = -100
+                else:
+                    labels = input_ids.clone()
+                
+                return {
+                    'input_ids': input_ids,
+                    'attention_mask': attention_mask,
+                    'labels': labels,
+                }
             else:
-                labels = input_ids.clone()
-            
-            result = {
-                'input_ids': input_ids,
-                'attention_mask': attention_mask,
-                'labels': labels,
-            }
-            
-        else:
-            # Fall back to standard processing
-            result = super().__getitem__(idx)
+                # Fall back to standard processing
+                return super()._tokenize_example(example)
+                
+        except Exception as e:
+            logging.error(f"Error tokenizing instruction example: {e}")
+            return None
+
+
+# Utility function to create streaming dataset
+def create_streaming_dataset(
+    data_path: Union[str, List[str]],
+    tokenizer,
+    dataset_type: str = "base",
+    batch_size_mb: float = 5.0,
+    cache_dir: Optional[str] = None,
+    **kwargs
+) -> StreamingINDRADataset:
+    """
+    Create a streaming dataset of the specified type.
+    
+    Args:
+        data_path: Path to data
+        tokenizer: Tokenizer instance
+        dataset_type: Type of dataset ('base', 'vedic', 'instruction')
+        batch_size_mb: Memory batch size in MB
+        cache_dir: Cache directory for processed data
+        **kwargs: Additional dataset arguments
         
-        return result
+    Returns:
+        Streaming dataset instance
+    """
+    common_args = {
+        'batch_size_mb': batch_size_mb,
+        'cache_dir': cache_dir,
+        **kwargs
+    }
+    
+    if dataset_type == "vedic":
+        return StreamingVedicDataset(data_path, tokenizer, **common_args)
+    elif dataset_type == "instruction":
+        return StreamingInstructionDataset(data_path, tokenizer, **common_args)
+    else:
+        return StreamingINDRADataset(data_path, tokenizer, **common_args)
