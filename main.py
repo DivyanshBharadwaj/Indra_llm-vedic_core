@@ -400,6 +400,7 @@ def create_datasets(args, tokenizer):
             dataset_type="base",
             max_length=args.max_seq_length,
             data_type=args.data_type,
+            batch_size_mb=1.0,  # Much smaller for validation
             batch_size_mb=args.batch_size_mb,
             cache_dir=args.cache_dir,
             shuffle_buffer_size=100,  # Smaller for validation
@@ -737,6 +738,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
