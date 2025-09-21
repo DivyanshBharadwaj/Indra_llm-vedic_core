@@ -379,9 +379,9 @@ class PretrainTrainer:
                     logging.warning(f"Error in validation batch {batch_idx}: {e}")
                     continue
                     
-        # 🧹 Clear memory again after validation ends
-        gc.collect()
-        torch.cuda.empty_cache()
+        # # 🧹 Clear memory again after validation ends
+        # gc.collect()
+        # torch.cuda.empty_cache()
         
         self.model.train()
         
@@ -493,6 +493,7 @@ class PretrainTrainer:
         logging.info(f"Resumed from step {self.global_step}")
         
         return checkpoint_info
+
 
 
 
