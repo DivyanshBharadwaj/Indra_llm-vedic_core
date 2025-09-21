@@ -13,7 +13,9 @@ __all__ = [
     'StreamingInstructionDataset',
     'INDRADataLoader',
     'create_dataloader',
-    'VedicCorpusProcessor'
+    'VedicCorpusProcessor',
+    'safe_collate_fn'
 ]
+
 
 
