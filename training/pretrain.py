@@ -338,7 +338,11 @@ class PretrainTrainer:
         """Run validation on streaming validation dataset."""
         if not self.val_loader:
             return {}
-        
+            
+        # 🧹 Clear memory before validation starts
+        gc.collect()
+        torch.cuda.empty_cache()
+    
         self.model.eval()
         
         total_loss = 0.0
@@ -374,6 +378,10 @@ class PretrainTrainer:
                 except Exception as e:
                     logging.warning(f"Error in validation batch {batch_idx}: {e}")
                     continue
+                    
+        # 🧹 Clear memory again after validation ends
+        gc.collect()
+        torch.cuda.empty_cache()
         
         self.model.train()
         
@@ -485,4 +493,5 @@ class PretrainTrainer:
         logging.info(f"Resumed from step {self.global_step}")
         
         return checkpoint_info
+
 
