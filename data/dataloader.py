@@ -17,7 +17,7 @@ class INDRADataLoader:
         dataset,
         batch_size: int = 8,
         shuffle: bool = True,
-        num_workers: int = 4,
+        num_workers: int = 2,
         pin_memory=torch.cuda.is_available(),
         drop_last: bool = True,
         collate_fn: Optional[callable] = None,
@@ -517,3 +517,4 @@ def create_dataloader(
         sampler=sampler,
         **{k: v for k, v in kwargs.items() if k not in ['language_weights', 'vedic_ratio', 'phase', 'max_tokens_per_batch']}
     )
+
