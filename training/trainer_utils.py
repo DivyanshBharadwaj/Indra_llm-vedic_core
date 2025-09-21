@@ -1,5 +1,5 @@
 """
-Training utilities for INDRA LLM
+Training utilities for INDRA LLM with streaming dataset support
 (c) Divyansh Bharadwaj
 """
 
@@ -17,7 +17,7 @@ from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, LinearLR
 import wandb
 
 class TrainerUtils:
-    """Utility functions for training."""
+    """Utility functions for training with streaming dataset support."""
     
     @staticmethod
     def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None):
@@ -79,6 +79,26 @@ class TrainerUtils:
         return {}
     
     @staticmethod
+    def get_streaming_dataset_info(dataset) -> Dict[str, Any]:
+        """Get information about streaming dataset."""
+        info = {}
+        
+        if hasattr(dataset, 'total_files'):
+            info['total_files'] = dataset.total_files
+        if hasattr(dataset, 'batch_size_mb'):
+            info['batch_size_mb'] = dataset.batch_size_mb
+        if hasattr(dataset, 'examples_per_batch'):
+            info['examples_per_batch'] = dataset.examples_per_batch
+        if hasattr(dataset, 'shuffle_buffer_size'):
+            info['shuffle_buffer_size'] = dataset.shuffle_buffer_size
+        if hasattr(dataset, '_shuffle_buffer'):
+            info['current_buffer_size'] = len(dataset._shuffle_buffer)
+        if hasattr(dataset, 'cache_dir'):
+            info['cache_dir'] = dataset.cache_dir
+        
+        return info
+    
+    @staticmethod
     def config_to_dict(config) -> Dict[str, Any]:
         """Convert config object to dictionary for JSON serialization."""
         if hasattr(config, '__dict__'):
@@ -126,9 +146,10 @@ class TrainerUtils:
         loss: float,
         checkpoint_dir: str,
         config: Dict[str, Any],
-        save_format: str = "both"  # "pt", "safetensors", "both"
+        save_format: str = "both",  # "pt", "safetensors", "both"
+        streaming_dataset_info: Optional[Dict[str, Any]] = None
     ):
-        """Save model checkpoint."""
+        """Save model checkpoint with streaming dataset info."""
         checkpoint_dir = Path(checkpoint_dir)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
@@ -144,6 +165,10 @@ class TrainerUtils:
             'loss': loss,
             'config': serializable_config,
         }
+        
+        # Add streaming dataset info if available
+        if streaming_dataset_info:
+            checkpoint['streaming_info'] = streaming_dataset_info
         
         # Save in PyTorch format
         if save_format in ["pt", "both"]:
@@ -178,6 +203,10 @@ class TrainerUtils:
                     'loss': str(loss),
                     'config': json.dumps(serializable_config)
                 }
+                
+                # Add streaming info to metadata
+                if streaming_dataset_info:
+                    metadata['streaming_info'] = json.dumps(streaming_dataset_info)
                 
                 safetensors_path = checkpoint_dir / f"checkpoint-step-{step}.safetensors"
                 save_file(tensors, safetensors_path, metadata=metadata)
@@ -234,7 +263,8 @@ class TrainerUtils:
         return {
             'step': checkpoint.get('step', 0),
             'loss': checkpoint.get('loss', float('inf')),
-            'config': checkpoint.get('config', {})
+            'config': checkpoint.get('config', {}),
+            'streaming_info': checkpoint.get('streaming_info', {})
         }
     
     @staticmethod
@@ -248,9 +278,9 @@ class TrainerUtils:
         """Load SafeTensors checkpoint."""
         try:
             from safetensors.torch import load_file
+            from safetensors import safe_open
             
             tensors = load_file(checkpoint_path)
-            metadata = {}
             
             # Extract model state dict
             model_state_dict = {}
@@ -277,17 +307,17 @@ class TrainerUtils:
                     logging.warning(f"Could not load optimizer state from safetensors: {e}")
             
             # Extract metadata
-            with open(checkpoint_path, 'rb') as f:
-                # Read safetensors header to get metadata
-                # This is a simplified approach
-                pass
+            metadata = {}
+            with safe_open(checkpoint_path, framework="pt") as f:
+                metadata = f.metadata()
             
             logging.info(f"Loaded SafeTensors checkpoint from {checkpoint_path}")
             
             return {
                 'step': int(metadata.get('step', 0)) if 'step' in metadata else 0,
                 'loss': float(metadata.get('loss', float('inf'))) if 'loss' in metadata else float('inf'),
-                'config': json.loads(metadata.get('config', '{}')) if 'config' in metadata else {}
+                'config': json.loads(metadata.get('config', '{}')) if 'config' in metadata else {},
+                'streaming_info': json.loads(metadata.get('streaming_info', '{}')) if 'streaming_info' in metadata else {}
             }
             
         except ImportError:
@@ -336,6 +366,23 @@ class TrainerUtils:
         """Estimate tokens processed per second."""
         total_tokens = batch_size * sequence_length * gradient_accumulation_steps
         return total_tokens / time_elapsed if time_elapsed > 0 else 0.0
+    
+    @staticmethod
+    def estimate_streaming_throughput(
+        examples_processed: int,
+        time_elapsed: float,
+        avg_sequence_length: int = 2048
+    ) -> Dict[str, float]:
+        """Estimate streaming dataset throughput."""
+        examples_per_sec = examples_processed / time_elapsed if time_elapsed > 0 else 0.0
+        tokens_per_sec = examples_per_sec * avg_sequence_length
+        
+        return {
+            'examples_per_second': examples_per_sec,
+            'tokens_per_second': tokens_per_sec,
+            'total_examples': examples_processed,
+            'total_time': time_elapsed
+        }
     
     @staticmethod
     def calculate_flops_per_token(
@@ -426,18 +473,6 @@ def get_scheduler(
                 # Cosine annealing
                 progress = (current_step - warmup_steps) / (max_steps - warmup_steps)
                 progress = min(1.0, progress)
-                cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
-                return min_lr_ratio + (1 - min_lr_ratio) * cosine_factor
-        
-        return LambdaLR(optimizer, lr_lambda)
-    
-    elif scheduler_name.lower() == "linear":
-        def lr_lambda(current_step: int) -> float:
-            if current_step < warmup_steps:
-                return current_step / warmup_steps
-            else:
-                progress = (current_step - warmup_steps) / (max_steps - warmup_steps)
-                progress = min(1.0, progress)
                 return min_lr_ratio + (1 - min_lr_ratio) * (1 - progress)
         
         return LambdaLR(optimizer, lr_lambda)
@@ -467,6 +502,45 @@ def get_scheduler(
     
     else:
         raise ValueError(f"Unknown scheduler: {scheduler_name}")
+
+class StreamingMetricsTracker(MetricsTracker):
+    """Enhanced metrics tracker for streaming datasets."""
+    
+    def __init__(self, window_size: int = 100):
+        super().__init__(window_size)
+        self.streaming_stats = {
+            'examples_processed': 0,
+            'batches_processed': 0,
+            'cache_hits': 0,
+            'cache_misses': 0,
+            'buffer_overflows': 0
+        }
+    
+    def update_streaming_stats(self, **kwargs):
+        """Update streaming-specific statistics."""
+        for key, value in kwargs.items():
+            if key in self.streaming_stats:
+                self.streaming_stats[key] += value
+    
+    def get_streaming_summary(self) -> Dict[str, Any]:
+        """Get summary of streaming statistics."""
+        summary = self.get_summary()
+        summary['streaming'] = self.streaming_stats.copy()
+        
+        # Calculate derived metrics
+        if self.streaming_stats['batches_processed'] > 0:
+            summary['streaming']['avg_examples_per_batch'] = (
+                self.streaming_stats['examples_processed'] / 
+                self.streaming_stats['batches_processed']
+            )
+        
+        if (self.streaming_stats['cache_hits'] + self.streaming_stats['cache_misses']) > 0:
+            summary['streaming']['cache_hit_rate'] = (
+                self.streaming_stats['cache_hits'] / 
+                (self.streaming_stats['cache_hits'] + self.streaming_stats['cache_misses'])
+            )
+        
+        return summary
 
 class MetricsTracker:
     """Track training metrics and statistics."""
@@ -543,4 +617,16 @@ class MetricsTracker:
                     'max': max(self.metrics[key]),
                     'count': len(self.metrics[key])
                 }
-        return summary
+        return summary / (max_steps - warmup_steps)
+                progress = min(1.0, progress)
+                cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
+                return min_lr_ratio + (1 - min_lr_ratio) * cosine_factor
+        
+        return LambdaLR(optimizer, lr_lambda)
+    
+    elif scheduler_name.lower() == "linear":
+        def lr_lambda(current_step: int) -> float:
+            if current_step < warmup_steps:
+                return current_step / warmup_steps
+            else:
+                progress = (current_step - warmup_steps)
