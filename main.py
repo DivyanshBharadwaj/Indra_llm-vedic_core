@@ -331,6 +331,8 @@ def create_training_config(args) -> TrainingConfig:
     config.pretrain.vedic_phase_steps = args.vedic_phase_steps
     config.pretrain.general_phase_steps = args.general_phase_steps
     config.pretrain.vedic_data_ratio = args.vedic_data_ratio
+    config.dataloader_num_workers = args.dataloader_num_workers
+
     
     return config
 
@@ -735,6 +737,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
