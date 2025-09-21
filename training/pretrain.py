@@ -1,11 +1,11 @@
 """
 Pre-training implementation for INDRA LLM with Vedic curriculum learning
+Modified to use streaming datasets for memory efficiency
 (c) Divyansh Bharadwaj
 """
 
 import os
 import glob
-
 import time
 import logging
 from typing import Dict, Optional, Any
@@ -18,17 +18,17 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from .trainer_utils import TrainerUtils, get_optimizer, get_scheduler, MetricsTracker
-from data import create_dataloader, VedicDataset, MultiLanguageDataset
+from data import StreamingINDRADataset, StreamingVedicDataset
 from model import INDRATransformer
 
 class PretrainTrainer:
-    """Pre-training trainer with Vedic curriculum learning."""
+    """Pre-training trainer with Vedic curriculum learning and streaming datasets."""
     
     def __init__(
         self,
         model: INDRATransformer,
         config,
-        train_dataset,
+        train_dataset,  # Now expects StreamingINDRADataset or StreamingVedicDataset
         val_dataset=None,
         tokenizer=None,
     ):
@@ -38,8 +38,8 @@ class PretrainTrainer:
         Args:
             model: INDRA transformer model
             config: Training configuration
-            train_dataset: Training dataset
-            val_dataset: Validation dataset
+            train_dataset: Streaming training dataset
+            val_dataset: Streaming validation dataset
             tokenizer: Tokenizer instance
         """
         self.model = model
@@ -76,7 +76,6 @@ class PretrainTrainer:
         )
         
         # Setup mixed precision
-        device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.scaler = GradScaler(enabled=config.use_fp16 or config.use_bf16)
         self.use_amp = config.use_fp16 or config.use_bf16
         self.amp_dtype = torch.float16 if config.use_fp16 else torch.bfloat16
@@ -89,7 +88,7 @@ class PretrainTrainer:
             "mixed": config.max_steps - config.pretrain.vedic_phase_steps - config.pretrain.general_phase_steps
         }
         
-        # Setup data loaders
+        # Setup data loaders - streaming datasets handle batching internally
         self.train_loader = self._create_train_loader()
         self.val_loader = self._create_val_loader() if val_dataset else None
         
@@ -107,6 +106,7 @@ class PretrainTrainer:
         # Log model info
         param_counts = TrainerUtils.count_parameters(self.model)
         logging.info(f"Model parameters: {param_counts}")
+        logging.info(f"Using streaming dataset with {train_dataset.total_files} files")
         
     def _setup_distributed_model(self) -> nn.Module:
         """Setup model for distributed training."""
@@ -133,51 +133,27 @@ class PretrainTrainer:
         return self.model.to(self.device)
     
     def _create_train_loader(self) -> DataLoader:
-        """Create training data loader with curriculum learning."""
-        if isinstance(self.train_dataset, VedicDataset):
-            # Use Vedic priority sampler
-            return create_dataloader(
-                self.train_dataset,
-                batch_size=self.config.batch_size,
-                shuffle=True,
-                num_workers=self.config.dataloader_num_workers,
-                sampler_type="vedic_priority",
-                phase=self.current_phase,
-                vedic_ratio=self.config.pretrain.vedic_data_ratio,
-                pin_memory=self.config.pin_memory,
-            )
-        elif isinstance(self.train_dataset, MultiLanguageDataset):
-            # Use language-aware sampler
-            return create_dataloader(
-                self.train_dataset,
-                batch_size=self.config.batch_size,
-                shuffle=True,
-                num_workers=self.config.dataloader_num_workers,
-                sampler_type="language_aware",
-                language_weights={'sanskrit': 2.0, 'hindi': 1.5, 'english': 1.0},
-                pin_memory=self.config.pin_memory,
-            )
-        else:
-            # Standard data loader
-            return create_dataloader(
-                self.train_dataset,
-                batch_size=self.config.batch_size,
-                shuffle=True,
-                num_workers=self.config.dataloader_num_workers,
-                pin_memory=self.config.pin_memory,
-            )
+        """Create training data loader for streaming datasets."""
+        # For streaming datasets, we use a simpler DataLoader setup
+        # The dataset itself handles the streaming and batching logic
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.config.batch_size,
+            num_workers=self.config.dataloader_num_workers if hasattr(self.config, 'dataloader_num_workers') else 0,
+            pin_memory=self.config.pin_memory if hasattr(self.config, 'pin_memory') else True,
+            # Note: shuffle=False because streaming dataset handles shuffling internally
+        )
     
     def _create_val_loader(self) -> Optional[DataLoader]:
-        """Create validation data loader."""
+        """Create validation data loader for streaming datasets."""
         if not self.val_dataset:
             return None
         
-        return create_dataloader(
+        return DataLoader(
             self.val_dataset,
             batch_size=self.config.eval_batch_size,
-            shuffle=False,
-            num_workers=self.config.dataloader_num_workers,
-            pin_memory=self.config.pin_memory,
+            num_workers=self.config.dataloader_num_workers if hasattr(self.config, 'dataloader_num_workers') else 0,
+            pin_memory=self.config.pin_memory if hasattr(self.config, 'pin_memory') else True,
         )
     
     def _update_curriculum_phase(self):
@@ -193,47 +169,40 @@ class PretrainTrainer:
             logging.info(f"Curriculum phase transition: {self.current_phase} -> {new_phase}")
             self.current_phase = new_phase
             
-            # Update data loader if needed
-            if isinstance(self.train_dataset, VedicDataset):
-                self.train_loader = self._create_train_loader()
+            # For streaming datasets, we don't need to recreate the loader
+            # The dataset handles phase transitions internally
     
     def train(self) -> Dict[str, Any]:
-        """Main training loop."""
+        """Main training loop with streaming datasets."""
         logging.info(f"Starting pre-training for {self.config.max_steps} steps")
+        logging.info(f"Using streaming dataset with memory budget: {self.train_dataset.batch_size_mb}MB")
         
         self.model.train()
         start_time = time.time()
         
-        # Training loop
-        while self.global_step < self.config.max_steps:
+        # Training loop - streaming datasets provide infinite iteration
+        try:
             epoch_loss = self._train_epoch()
             
-##            # Validation
-##            if self.val_loader and self.global_step % self.config.eval_steps == 0:
-##                val_metrics = self._validate()
-##                self.metrics_tracker.update(val_metrics, self.global_step)
-##                
-##                if self.wandb:
-##                    self.wandb.log(val_metrics, step=self.global_step)
-##            
-##            # Save checkpoint
-##            if self.global_step % self.config.save_steps == 0:
-##                self._save_checkpoint()
+            # Final validation and save
+            if self.val_loader:
+                final_metrics = self._validate()
+                logging.info(f"Final validation metrics: {final_metrics}")
             
-            # Update curriculum phase
-##            self._update_curriculum_phase()
+            self._save_checkpoint(final=True)
             
-            self.epoch += 1
-            
-            if self.global_step >= self.config.max_steps:
-                break
+        except KeyboardInterrupt:
+            logging.info("Training interrupted by user")
+            self._save_checkpoint(final=True)
         
-        # Final validation and save
-        if self.val_loader:
-            final_metrics = self._validate()
-            logging.info(f"Final validation metrics: {final_metrics}")
-        
-        self._save_checkpoint(final=True)
+        except Exception as e:
+            logging.error(f"Training failed with error: {e}")
+            # Save emergency checkpoint
+            try:
+                self._save_checkpoint(final=True)
+            except:
+                pass
+            raise
         
         total_time = time.time() - start_time
         logging.info(f"Pre-training completed in {total_time:.2f} seconds")
@@ -244,179 +213,111 @@ class PretrainTrainer:
             'final_metrics': self.metrics_tracker.get_summary()
         }
     
-    # def _train_epoch(self) -> float:
-    #     """Train for one epoch."""
-    #     self.model.train()
-    #     epoch_loss = 0.0
-    #     step_count = 0
-        
-    #     for batch_idx, batch in enumerate(self.train_loader):
-    #         print(f"Processing batch {batch_idx}, step {self.current_step}")
-            
-    #         try:
-    #             loss = self._train_step(batch)
-    #             epoch_loss += loss
-    #             step_count += 1
-                
-    #             # Log progress
-    #             if step_count % self.config.logging_steps == 0:
-    #                 avg_loss = epoch_loss / step_count
-    #                 print(f"Step {self.current_step}: Loss = {loss:.4f}, Avg Loss = {avg_loss:.4f}")
-                
-    #             # Check if we should stop
-    #             if self.current_step >= self.config.max_steps:
-    #                 print(f"Reached max steps ({self.config.max_steps}), stopping...")
-    #                 break
-                    
-    #             # CRITICAL: Increment step counter
-    #             self.current_step += 1
-                
-    #         except Exception as e:
-    #             print(f"Error in training step {batch_idx}: {e}")
-    #             import traceback
-    #             traceback.print_exc()
-    #             break
-        
-    #     return epoch_loss / max(step_count, 1)
-
     def _train_epoch(self) -> float:
-        """Train for one epoch."""
+        """Train with streaming dataset - runs until max_steps reached."""
         epoch_loss = 0.0
         num_batches = 0
         
+        # Streaming datasets provide infinite iteration until we break
         for batch_idx, batch in enumerate(self.train_loader):
             if self.global_step >= self.config.max_steps:
+                logging.info(f"Reached max steps ({self.config.max_steps}), stopping training")
                 break
             
-            loss = self._train_step(batch)
-            epoch_loss += loss
-            num_batches += 1
-            
-            # Logging
-            if self.global_step % self.config.logging_steps == 0:
-                self._log_metrics(loss)
-            
-            self.global_step += 1
-
-            # Update curriculum phase
-            self._update_curriculum_phase()
-
-           # Validation
-            if self.val_loader and self.global_step > 0 and self.global_step % self.config.eval_steps == 0:
-                val_metrics = self._validate()
-                self.metrics_tracker.update(val_metrics, self.global_step)
+            try:
+                loss = self._train_step(batch)
+                epoch_loss += loss
+                num_batches += 1
                 
-                # --- ADD THIS LINE TO PRINT THE VALIDATION LOSS ---
-                log_info(f"Step {self.global_step}: val_loss={val_metrics['val_loss']:.4f}")
+                # Logging
+                if self.global_step % self.config.logging_steps == 0:
+                    self._log_metrics(loss)
                 
-                if self.wandb:
-                    self.wandb.log(val_metrics, step=self.global_step)
-            
-            # Save checkpoint
-            if self.global_step > 0 and self.global_step % self.config.save_steps == 0:
-                self._save_checkpoint()
+                # Update curriculum phase
+                self._update_curriculum_phase()
+
+                # Validation
+                if self.val_loader and self.global_step > 0 and self.global_step % self.config.eval_steps == 0:
+                    val_metrics = self._validate()
+                    self.metrics_tracker.update(val_metrics, self.global_step)
+                    
+                    logging.info(f"Step {self.global_step}: val_loss={val_metrics['val_loss']:.4f}")
+                    
+                    if self.wandb:
+                        self.wandb.log(val_metrics, step=self.global_step)
+                
+                # Save checkpoint
+                if self.global_step > 0 and self.global_step % self.config.save_steps == 0:
+                    self._save_checkpoint()
+                
+                self.global_step += 1
+                
+            except Exception as e:
+                logging.error(f"Error in training step {batch_idx}: {e}")
+                # For streaming, we can continue with next batch
+                continue
         
         return epoch_loss / max(num_batches, 1)
-
-    # def _train_step(self, batch):
-    #     """Single training step with debugging."""
-    #     print(f"Training step {self.current_step} starting...")
-        
-    #     # Move batch to device
-    #     batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-    #              for k, v in batch.items()}
-        
-    #     # Remove the repeated debug prints from transformer.py
-    #     # The issue is likely here - check if this step actually completes
-        
-    #     try:
-    #         outputs = self.model(
-    #             input_ids=batch['input_ids'],
-    #             attention_mask=batch['attention_mask'],
-    #             labels=batch['labels'],
-    #             compute_vedic_rewards=True,
-    #         )
-            
-    #         loss = outputs['loss'] if isinstance(outputs, dict) else outputs[0]
-    #         print(f"Training step {self.current_step} completed with loss: {loss.item():.4f}")
-            
-    #         # Backward pass
-    #         loss.backward()
-            
-    #         # Gradient step
-    #         if (self.current_step + 1) % self.config.gradient_accumulation_steps == 0:
-    #             self.optimizer.step()
-    #             self.optimizer.zero_grad()
-            
-    #         return loss.item()
-            
-    #     except Exception as e:
-    #         print(f"Error in _train_step: {e}")
-    #         raise
     
     def _train_step(self, batch: Dict[str, torch.Tensor]) -> float:
-        """Single training step."""
+        """Single training step with streaming dataset batch."""
         try:
-          # Move batch to device
-          batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                  for k, v in batch.items()}
-          
-          # Forward pass with mixed precision
-          device_type = 'cuda' if torch.cuda.is_available() else 'cpu'
-          use_autocast = (self.use_amp and torch.cuda.is_available())
-          
-          if use_autocast:
-              with autocast(dtype=self.amp_dtype, enabled=self.use_amp):
-                  outputs = self.model(
-                      input_ids=batch['input_ids'],
-                      attention_mask=batch['attention_mask'],
-                      labels=batch['labels'],
-                      compute_vedic_rewards=True,
-                  )
-                  loss = outputs['loss'] if isinstance(outputs, dict) else outputs.loss
-
-          else:
-              outputs = self.model(
-                  input_ids=batch['input_ids'],
-                  attention_mask=batch['attention_mask'],
-                  labels=batch['labels'],
-                  compute_vedic_rewards=True,
-              )
-              loss = outputs['loss'] if isinstance(outputs, dict) else outputs.loss
-              
-              # loss = outputs['loss']
-              
-              # # Scale loss for gradient accumulation
-              # loss = loss / self.config.gradient_accumulation_steps
-          
-          # Backward pass
-          if self.use_amp:
-              self.scaler.scale(loss).backward()
-          else:
-              loss.backward()
-          
-          # Gradient accumulation
-          if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
-              # Gradient clipping
-              if self.use_amp:
-                  self.scaler.unscale_(self.optimizer)
-              
-              torch.nn.utils.clip_grad_norm_(
-                  self.model.parameters(), 
-                  self.config.pretrain.grad_clip
-              )
-              
-              # Optimizer step
-              if self.use_amp:
-                  self.scaler.step(self.optimizer)
-                  self.scaler.update()
-              else:
-                  self.optimizer.step()
-              
-              self.scheduler.step()
-              self.optimizer.zero_grad()
-          
-          return loss.item() * self.config.gradient_accumulation_steps
+            # Move batch to device
+            batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                    for k, v in batch.items()}
+            
+            # Forward pass with mixed precision
+            use_autocast = (self.use_amp and torch.cuda.is_available())
+            
+            if use_autocast:
+                with autocast(dtype=self.amp_dtype, enabled=self.use_amp):
+                    outputs = self.model(
+                        input_ids=batch['input_ids'],
+                        attention_mask=batch.get('attention_mask'),
+                        labels=batch.get('labels'),
+                        compute_vedic_rewards=True,
+                    )
+                    loss = outputs['loss'] if isinstance(outputs, dict) else outputs.loss
+            else:
+                outputs = self.model(
+                    input_ids=batch['input_ids'],
+                    attention_mask=batch.get('attention_mask'),
+                    labels=batch.get('labels'),
+                    compute_vedic_rewards=True,
+                )
+                loss = outputs['loss'] if isinstance(outputs, dict) else outputs.loss
+            
+            # Scale loss for gradient accumulation
+            loss = loss / self.config.gradient_accumulation_steps
+            
+            # Backward pass
+            if self.use_amp:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+            
+            # Gradient accumulation
+            if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
+                # Gradient clipping
+                if self.use_amp:
+                    self.scaler.unscale_(self.optimizer)
+                
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), 
+                    self.config.pretrain.grad_clip
+                )
+                
+                # Optimizer step
+                if self.use_amp:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+                
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+            
+            return loss.item() * self.config.gradient_accumulation_steps
 
         except Exception as e:
             logging.error(f"Error in training step: {e}")
@@ -430,38 +331,49 @@ class PretrainTrainer:
                     else:
                         logging.error(f"  {k}: {type(v)}")
             
-            # Re-raise the exception to stop training
-            raise
+            # For streaming, we can skip this batch and continue
+            return 0.0
     
     def _validate(self) -> Dict[str, float]:
-        """Run validation."""
+        """Run validation on streaming validation dataset."""
+        if not self.val_loader:
+            return {}
+        
         self.model.eval()
         
         total_loss = 0.0
         total_aux_loss = 0.0
         total_vedic_loss = 0.0
         num_batches = 0
+        max_val_batches = 100  # Limit validation batches for streaming
         
         with torch.no_grad():
-            for batch in self.val_loader:
-                # Move batch to device
-                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                        for k, v in batch.items()}
+            for batch_idx, batch in enumerate(self.val_loader):
+                if batch_idx >= max_val_batches:
+                    break
                 
-                # Forward pass
-##                with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
-                with autocast(dtype=self.amp_dtype, enabled=self.use_amp):
-                    outputs = self.model(
-                        input_ids=batch['input_ids'],
-                        attention_mask=batch.get('attention_mask'),
-                        labels=batch.get('labels'),
-                        compute_vedic_rewards=True
-                    )
-                
-                total_loss += outputs['loss'].item()
-                total_aux_loss += outputs.get('aux_losses', {}).get('total_aux_loss', 0.0)
-                total_vedic_loss += outputs.get('aux_losses', {}).get('vedic_alignment_loss', 0.0)
-                num_batches += 1
+                try:
+                    # Move batch to device
+                    batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                            for k, v in batch.items()}
+                    
+                    # Forward pass
+                    with autocast(dtype=self.amp_dtype, enabled=self.use_amp):
+                        outputs = self.model(
+                            input_ids=batch['input_ids'],
+                            attention_mask=batch.get('attention_mask'),
+                            labels=batch.get('labels'),
+                            compute_vedic_rewards=True
+                        )
+                    
+                    total_loss += outputs['loss'].item()
+                    total_aux_loss += outputs.get('aux_losses', {}).get('total_aux_loss', 0.0)
+                    total_vedic_loss += outputs.get('aux_losses', {}).get('vedic_alignment_loss', 0.0)
+                    num_batches += 1
+                    
+                except Exception as e:
+                    logging.warning(f"Error in validation batch {batch_idx}: {e}")
+                    continue
         
         self.model.train()
         
@@ -472,7 +384,7 @@ class PretrainTrainer:
         }
     
     def _log_metrics(self, loss: float):
-        """Log training metrics."""
+        """Log training metrics with streaming dataset info."""
         # Calculate tokens per second
         current_time = time.time()
         if not hasattr(self, '_last_log_time'):
@@ -483,7 +395,7 @@ class PretrainTrainer:
         time_diff = current_time - self._last_log_time
         step_diff = self.global_step - self._last_log_step
         
-        if time_diff > 0:
+        if time_diff > 0 and step_diff > 0:
             tokens_per_sec = TrainerUtils.estimate_tokens_per_second(
                 self.config.batch_size,
                 self.config.max_seq_length,
@@ -499,6 +411,11 @@ class PretrainTrainer:
         # Current learning rate
         current_lr = self.scheduler.get_last_lr()[0]
         
+        # Add streaming-specific metrics
+        streaming_stats = {}
+        if hasattr(self.train_dataset, '_shuffle_buffer'):
+            streaming_stats['buffer_size'] = len(self.train_dataset._shuffle_buffer)
+        
         metrics = {
             'train_loss': loss,
             'learning_rate': current_lr,
@@ -506,8 +423,10 @@ class PretrainTrainer:
             'global_step': self.global_step,
             'epoch': self.epoch,
             'curriculum_phase': self.current_phase,
+            'memory_batch_mb': self.train_dataset.batch_size_mb,
         }
         metrics.update(memory_stats)
+        metrics.update(streaming_stats)
         
         # Update tracker
         self.metrics_tracker.update(metrics, self.global_step)
@@ -515,7 +434,8 @@ class PretrainTrainer:
         # Log to console
         logging.info(
             f"Step {self.global_step}: loss={loss:.4f}, lr={current_lr:.2e}, "
-            f"tokens/s={tokens_per_sec:.0f}, phase={self.current_phase}"
+            f"tokens/s={tokens_per_sec:.0f}, phase={self.current_phase}, "
+            f"mem_batch={self.train_dataset.batch_size_mb}MB"
         )
         
         # Log to wandb
@@ -565,5 +485,3 @@ class PretrainTrainer:
         logging.info(f"Resumed from step {self.global_step}")
         
         return checkpoint_info
-
-
