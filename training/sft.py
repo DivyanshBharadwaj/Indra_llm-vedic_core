@@ -1,5 +1,6 @@
 """
 Supervised Fine-tuning (SFT) trainer for INDRA LLM with instruction following
+Modified to use streaming datasets for memory efficiency
 (c) Divyansh Bharadwaj
 """
 
@@ -15,17 +16,17 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 
 from .trainer_utils import TrainerUtils, get_optimizer, get_scheduler, MetricsTracker
-from data import InstructionDataset, create_dataloader
+from data import StreamingInstructionDataset
 from model import INDRATransformer
 
 class SFTTrainer:
-    """Supervised Fine-tuning trainer for instruction following and task-specific training."""
+    """Supervised Fine-tuning trainer for instruction following and task-specific training with streaming datasets."""
     
     def __init__(
         self,
         model: INDRATransformer,
         config,
-        train_dataset,
+        train_dataset,  # Now expects StreamingInstructionDataset
         val_dataset=None,
         tokenizer=None,
     ):
@@ -35,8 +36,8 @@ class SFTTrainer:
         Args:
             model: Pre-trained INDRA transformer model
             config: Training configuration
-            train_dataset: Instruction training dataset
-            val_dataset: Validation dataset
+            train_dataset: Streaming instruction training dataset
+            val_dataset: Streaming validation dataset
             tokenizer: Tokenizer instance
         """
         self.model = model
@@ -72,7 +73,7 @@ class SFTTrainer:
         self.use_amp = config.use_fp16 or config.use_bf16
         self.amp_dtype = torch.float16 if config.use_fp16 else torch.bfloat16
         
-        # Setup data loaders
+        # Setup data loaders for streaming datasets
         self.train_loader = self._create_train_loader()
         self.val_loader = self._create_val_loader() if val_dataset else None
         
@@ -96,64 +97,61 @@ class SFTTrainer:
         param_counts = TrainerUtils.count_parameters(self.model)
         logging.info(f"SFT Model parameters: {param_counts}")
         logging.info(f"Response loss only: {self.response_loss_only}")
+        logging.info(f"Using streaming dataset with {train_dataset.total_files} files")
+        logging.info(f"Memory batch size: {train_dataset.batch_size_mb}MB")
     
     def _create_train_loader(self) -> DataLoader:
-        """Create training data loader for instruction data."""
-        return create_dataloader(
+        """Create training data loader for streaming instruction data."""
+        return DataLoader(
             self.train_dataset,
             batch_size=self.config.batch_size,
-            shuffle=True,
-            num_workers=self.config.dataloader_num_workers,
-            pin_memory=self.config.pin_memory,
+            num_workers=self.config.dataloader_num_workers if hasattr(self.config, 'dataloader_num_workers') else 0,
+            pin_memory=self.config.pin_memory if hasattr(self.config, 'pin_memory') else True,
         )
     
     def _create_val_loader(self) -> Optional[DataLoader]:
-        """Create validation data loader."""
+        """Create validation data loader for streaming datasets."""
         if not self.val_dataset:
             return None
         
-        return create_dataloader(
+        return DataLoader(
             self.val_dataset,
             batch_size=self.config.eval_batch_size,
-            shuffle=False,
-            num_workers=self.config.dataloader_num_workers,
-            pin_memory=self.config.pin_memory,
+            num_workers=self.config.dataloader_num_workers if hasattr(self.config, 'dataloader_num_workers') else 0,
+            pin_memory=self.config.pin_memory if hasattr(self.config, 'pin_memory') else True,
         )
     
     def train(self) -> Dict[str, Any]:
-        """Main SFT training loop."""
+        """Main SFT training loop with streaming datasets."""
         logging.info(f"Starting supervised fine-tuning for {self.config.max_steps} steps")
+        logging.info(f"Using streaming dataset with memory budget: {self.train_dataset.batch_size_mb}MB")
         
         self.model.train()
         start_time = time.time()
         
-        # Training loop
-        while self.global_step < self.config.max_steps:
+        # Training loop with streaming datasets
+        try:
             epoch_loss = self._train_epoch()
             
-            # Validation
-            if self.val_loader and self.global_step % self.config.eval_steps == 0:
-                val_metrics = self._validate()
-                self.metrics_tracker.update(val_metrics, self.global_step)
-                
-                if self.wandb:
-                    self.wandb.log(val_metrics, step=self.global_step)
+            # Final validation and save
+            if self.val_loader:
+                final_metrics = self._validate()
+                logging.info(f"Final SFT validation metrics: {final_metrics}")
             
-            # Save checkpoint
-            if self.global_step % self.config.save_steps == 0:
-                self._save_checkpoint()
+            self._save_checkpoint(final=True)
             
-            self.epoch += 1
-            
-            if self.global_step >= self.config.max_steps:
-                break
+        except KeyboardInterrupt:
+            logging.info("SFT training interrupted by user")
+            self._save_checkpoint(final=True)
         
-        # Final validation and save
-        if self.val_loader:
-            final_metrics = self._validate()
-            logging.info(f"Final SFT validation metrics: {final_metrics}")
-        
-        self._save_checkpoint(final=True)
+        except Exception as e:
+            logging.error(f"SFT training failed with error: {e}")
+            # Save emergency checkpoint
+            try:
+                self._save_checkpoint(final=True)
+            except:
+                pass
+            raise
         
         total_time = time.time() - start_time
         logging.info(f"SFT training completed in {total_time:.2f} seconds")
@@ -165,86 +163,120 @@ class SFTTrainer:
         }
     
     def _train_epoch(self) -> float:
-        """Train for one epoch."""
+        """Train with streaming dataset - runs until max_steps reached."""
         epoch_loss = 0.0
         num_batches = 0
         
+        # Streaming datasets provide infinite iteration until we break
         for batch_idx, batch in enumerate(self.train_loader):
             if self.global_step >= self.config.max_steps:
+                logging.info(f"Reached max steps ({self.config.max_steps}), stopping SFT training")
                 break
             
-            loss = self._train_step(batch)
-            epoch_loss += loss
-            num_batches += 1
-            
-            # Logging
-            if self.global_step % self.config.logging_steps == 0:
-                self._log_metrics(loss)
-            
-            self.global_step += 1
+            try:
+                loss = self._train_step(batch)
+                epoch_loss += loss
+                num_batches += 1
+                
+                # Logging
+                if self.global_step % self.config.logging_steps == 0:
+                    self._log_metrics(loss)
+                
+                # Validation
+                if self.val_loader and self.global_step > 0 and self.global_step % self.config.eval_steps == 0:
+                    val_metrics = self._validate()
+                    self.metrics_tracker.update(val_metrics, self.global_step)
+                    
+                    logging.info(f"Step {self.global_step}: val_loss={val_metrics.get('val_loss', 0.0):.4f}")
+                    
+                    if self.wandb:
+                        self.wandb.log(val_metrics, step=self.global_step)
+                
+                # Save checkpoint
+                if self.global_step > 0 and self.global_step % self.config.save_steps == 0:
+                    self._save_checkpoint()
+                
+                self.global_step += 1
+                
+            except Exception as e:
+                logging.error(f"Error in SFT training batch {batch_idx}: {e}")
+                # For streaming, we can continue with next batch
+                continue
         
         return epoch_loss / max(num_batches, 1)
     
     def _train_step(self, batch: Dict[str, torch.Tensor]) -> float:
-        """Single SFT training step with instruction-response format."""
-        # Move batch to device
-        batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                for k, v in batch.items()}
-        
-        # Forward pass with mixed precision
-##        with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
-        with autocast(dtype=self.amp_dtype, enabled=self.use_amp):
-            outputs = self.model(
-                input_ids=batch['input_ids'],
-                attention_mask=batch.get('attention_mask'),
-                labels=batch.get('labels'),
-                compute_vedic_rewards=True  # Keep Vedic alignment during SFT
-            )
+        """Single SFT training step with instruction-response format and streaming dataset batch."""
+        try:
+            # Move batch to device
+            batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                    for k, v in batch.items()}
             
-            loss = outputs['loss']
+            # Forward pass with mixed precision
+            use_autocast = (self.use_amp and torch.cuda.is_available())
             
-#             # Add Vedic alignment loss if available
-#             aux_losses = outputs.get('aux_losses', {})
-#             vedic_alignment_loss = aux_losses.get('vedic_alignment_loss', 0.0)
-            
-# ##            if isinstance(vedic_alignment_loss, torch.Tensor):
-#             if isinstance(vedic_alignment_loss, torch.Tensor) and not (torch.isnan(vedic_alignment_loss) or torch.isinf(vedic_alignment_loss)):
-#                 loss = loss + 0.1 * vedic_alignment_loss  # Small weight for SFT
+            if use_autocast:
+                with autocast(dtype=self.amp_dtype, enabled=self.use_amp):
+                    outputs = self.model(
+                        input_ids=batch['input_ids'],
+                        attention_mask=batch.get('attention_mask'),
+                        labels=batch.get('labels'),
+                        compute_vedic_rewards=True  # Keep Vedic alignment during SFT
+                    )
+                    
+                    loss = outputs['loss']
+            else:
+                outputs = self.model(
+                    input_ids=batch['input_ids'],
+                    attention_mask=batch.get('attention_mask'),
+                    labels=batch.get('labels'),
+                    compute_vedic_rewards=True  # Keep Vedic alignment during SFT
+                )
+                
+                loss = outputs['loss']
             
             # Scale loss for gradient accumulation
             loss = loss / self.config.gradient_accumulation_steps
-        
-        # Backward pass
-        if self.use_amp:
-            self.scaler.scale(loss).backward()
-        else:
-            loss.backward()
-        
-        # Gradient accumulation
-        if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
-            # Gradient clipping
-            if self.use_amp:
-                self.scaler.unscale_(self.optimizer)
             
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), 
-                self.config.sft.grad_clip
-            )
-            
-            # Optimizer step
+            # Backward pass
             if self.use_amp:
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                self.scaler.scale(loss).backward()
             else:
-                self.optimizer.step()
+                loss.backward()
             
-            self.scheduler.step()
-            self.optimizer.zero_grad()
-        
-        return loss.item() * self.config.gradient_accumulation_steps
+            # Gradient accumulation
+            if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
+                # Gradient clipping
+                if self.use_amp:
+                    self.scaler.unscale_(self.optimizer)
+                
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), 
+                    self.config.sft.grad_clip
+                )
+                
+                # Optimizer step
+                if self.use_amp:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+                
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+            
+            return loss.item() * self.config.gradient_accumulation_steps
+
+        except Exception as e:
+            logging.error(f"Error in SFT training step: {e}")
+            # For streaming, we can skip this batch and continue
+            return 0.0
     
     def _validate(self) -> Dict[str, float]:
-        """Run validation on instruction-following tasks."""
+        """Run validation on instruction-following tasks with streaming datasets."""
+        if not self.val_loader:
+            return {}
+        
         self.model.eval()
         
         total_loss = 0.0
@@ -253,36 +285,44 @@ class SFTTrainer:
         correct_responses = 0
         total_responses = 0
         num_batches = 0
+        max_val_batches = 50  # Limit validation batches for streaming
         
         with torch.no_grad():
-            for batch in self.val_loader:
-                # Move batch to device
-                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                        for k, v in batch.items()}
+            for batch_idx, batch in enumerate(self.val_loader):
+                if batch_idx >= max_val_batches:
+                    break
                 
-                # Forward pass
-##                with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
-                with autocast(dtype=self.amp_dtype, enabled=self.use_amp):
-                    outputs = self.model(
-                        input_ids=batch['input_ids'],
-                        attention_mask=batch.get('attention_mask'),
-                        labels=batch.get('labels'),
-                        compute_vedic_rewards=True
-                    )
-                
-                total_loss += outputs['loss'].item()
-                
-                # Calculate instruction vs response accuracy
-                if 'instruction' in batch and 'response' in batch:
-                    response_accuracy = self._calculate_response_accuracy(
-                        outputs['logits'], 
-                        batch['labels'],
-                        batch.get('attention_mask')
-                    )
-                    correct_responses += response_accuracy['correct']
-                    total_responses += response_accuracy['total']
-                
-                num_batches += 1
+                try:
+                    # Move batch to device
+                    batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                            for k, v in batch.items()}
+                    
+                    # Forward pass
+                    with autocast(dtype=self.amp_dtype, enabled=self.use_amp):
+                        outputs = self.model(
+                            input_ids=batch['input_ids'],
+                            attention_mask=batch.get('attention_mask'),
+                            labels=batch.get('labels'),
+                            compute_vedic_rewards=True
+                        )
+                    
+                    total_loss += outputs['loss'].item()
+                    
+                    # Calculate instruction vs response accuracy
+                    if 'instruction' in batch and 'response' in batch:
+                        response_accuracy = self._calculate_response_accuracy(
+                            outputs['logits'], 
+                            batch['labels'],
+                            batch.get('attention_mask')
+                        )
+                        correct_responses += response_accuracy['correct']
+                        total_responses += response_accuracy['total']
+                    
+                    num_batches += 1
+                    
+                except Exception as e:
+                    logging.warning(f"Error in SFT validation batch {batch_idx}: {e}")
+                    continue
         
         self.model.train()
         
@@ -317,7 +357,7 @@ class SFTTrainer:
         }
     
     def _log_metrics(self, loss: float):
-        """Log SFT training metrics."""
+        """Log SFT training metrics with streaming dataset info."""
         # Calculate tokens per second
         current_time = time.time()
         if not hasattr(self, '_last_log_time'):
@@ -328,7 +368,7 @@ class SFTTrainer:
         time_diff = current_time - self._last_log_time
         step_diff = self.global_step - self._last_log_step
         
-        if time_diff > 0:
+        if time_diff > 0 and step_diff > 0:
             tokens_per_sec = TrainerUtils.estimate_tokens_per_second(
                 self.config.batch_size,
                 self.config.max_seq_length,
@@ -344,14 +384,21 @@ class SFTTrainer:
         # Current learning rate
         current_lr = self.scheduler.get_last_lr()[0]
         
+        # Add streaming-specific metrics
+        streaming_stats = {}
+        if hasattr(self.train_dataset, '_shuffle_buffer'):
+            streaming_stats['buffer_size'] = len(self.train_dataset._shuffle_buffer)
+        
         metrics = {
             'sft_loss': loss,
             'learning_rate': current_lr,
             'tokens_per_second': tokens_per_sec,
             'global_step': self.global_step,
             'epoch': self.epoch,
+            'memory_batch_mb': self.train_dataset.batch_size_mb,
         }
         metrics.update(memory_stats)
+        metrics.update(streaming_stats)
         
         # Update tracker
         self.metrics_tracker.update(metrics, self.global_step)
@@ -359,7 +406,7 @@ class SFTTrainer:
         # Log to console
         logging.info(
             f"SFT Step {self.global_step}: loss={loss:.4f}, lr={current_lr:.2e}, "
-            f"tokens/s={tokens_per_sec:.0f}"
+            f"tokens/s={tokens_per_sec:.0f}, mem_batch={self.train_dataset.batch_size_mb}MB"
         )
         
         # Log to wandb
@@ -501,6 +548,3 @@ class SFTTrainer:
         results['response_rate'] = non_empty_count / max(len(response_lengths), 1)
         
         return results
-
-
-
