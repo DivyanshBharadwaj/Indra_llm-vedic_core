@@ -135,8 +135,43 @@ class PretrainTrainer:
     
     def _create_train_loader(self) -> DataLoader:
         """Create training data loader for streaming datasets."""
-        # Import the safe collate function
-        from data import safe_collate_fn
+        # Define safe collate function locally
+        def safe_collate_fn(batch):
+            """Custom collate function that handles inconsistent dict keys safely."""
+            if not batch:
+                return {}
+            
+            # Get all possible keys from all examples
+            all_keys = set()
+            for example in batch:
+                if isinstance(example, dict):
+                    all_keys.update(example.keys())
+            
+            # Create the collated batch
+            collated = {}
+            
+            for key in all_keys:
+                values = []
+                for example in batch:
+                    if isinstance(example, dict) and key in example:
+                        values.append(example[key])
+                
+                if values:
+                    # Only collate if we have values
+                    try:
+                        if isinstance(values[0], torch.Tensor):
+                            collated[key] = torch.stack(values)
+                        elif isinstance(values[0], (int, float)):
+                            collated[key] = torch.tensor(values)
+                        elif isinstance(values[0], str):
+                            collated[key] = values  # Keep as list for strings
+                        else:
+                            collated[key] = values  # Keep as list for other types
+                    except Exception as e:
+                        # If collation fails, keep as list
+                        collated[key] = values
+            
+            return collated
         
         # For streaming datasets, we use a simpler DataLoader setup
         # The dataset itself handles the streaming and batching logic
@@ -154,8 +189,43 @@ class PretrainTrainer:
         if not self.val_dataset:
             return None
         
-        # Import the safe collate function
-        from data import safe_collate_fn
+        # Define safe collate function locally
+        def safe_collate_fn(batch):
+            """Custom collate function that handles inconsistent dict keys safely."""
+            if not batch:
+                return {}
+            
+            # Get all possible keys from all examples
+            all_keys = set()
+            for example in batch:
+                if isinstance(example, dict):
+                    all_keys.update(example.keys())
+            
+            # Create the collated batch
+            collated = {}
+            
+            for key in all_keys:
+                values = []
+                for example in batch:
+                    if isinstance(example, dict) and key in example:
+                        values.append(example[key])
+                
+                if values:
+                    # Only collate if we have values
+                    try:
+                        if isinstance(values[0], torch.Tensor):
+                            collated[key] = torch.stack(values)
+                        elif isinstance(values[0], (int, float)):
+                            collated[key] = torch.tensor(values)
+                        elif isinstance(values[0], str):
+                            collated[key] = values  # Keep as list for strings
+                        else:
+                            collated[key] = values  # Keep as list for other types
+                    except Exception as e:
+                        # If collation fails, keep as list
+                        collated[key] = values
+            
+            return collated
         
         return DataLoader(
             self.val_dataset,
