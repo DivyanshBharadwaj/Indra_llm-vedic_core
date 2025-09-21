@@ -10,7 +10,7 @@ import time
 import logging
 from typing import Dict, Optional, Any
 from pathlib import Path
-import gc
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -20,6 +20,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from .trainer_utils import TrainerUtils, get_optimizer, get_scheduler, MetricsTracker, StreamingMetricsTracker
 from data import StreamingINDRADataset, StreamingVedicDataset
 from model import INDRATransformer
+
 
 class PretrainTrainer:
     """Pre-training trainer with Vedic curriculum learning and streaming datasets."""
@@ -134,6 +135,9 @@ class PretrainTrainer:
     
     def _create_train_loader(self) -> DataLoader:
         """Create training data loader for streaming datasets."""
+        # Import the safe collate function
+        from data import safe_collate_fn
+        
         # For streaming datasets, we use a simpler DataLoader setup
         # The dataset itself handles the streaming and batching logic
         return DataLoader(
@@ -141,6 +145,7 @@ class PretrainTrainer:
             batch_size=self.config.batch_size,
             num_workers=self.config.dataloader_num_workers if hasattr(self.config, 'dataloader_num_workers') else 0,
             pin_memory=self.config.pin_memory if hasattr(self.config, 'pin_memory') else True,
+            collate_fn=safe_collate_fn,  # Use safe collate function
             # Note: shuffle=False because streaming dataset handles shuffling internally
         )
     
@@ -149,11 +154,15 @@ class PretrainTrainer:
         if not self.val_dataset:
             return None
         
+        # Import the safe collate function
+        from data import safe_collate_fn
+        
         return DataLoader(
             self.val_dataset,
             batch_size=self.config.eval_batch_size,
             num_workers=self.config.dataloader_num_workers if hasattr(self.config, 'dataloader_num_workers') else 0,
             pin_memory=self.config.pin_memory if hasattr(self.config, 'pin_memory') else True,
+            collate_fn=safe_collate_fn,  # Use safe collate function
         )
     
     def _update_curriculum_phase(self):
@@ -338,11 +347,7 @@ class PretrainTrainer:
         """Run validation on streaming validation dataset."""
         if not self.val_loader:
             return {}
-            
-        # # 🧹 Clear memory before validation starts
-        # gc.collect()
-        # torch.cuda.empty_cache()
-    
+        
         self.model.eval()
         
         total_loss = 0.0
@@ -378,10 +383,6 @@ class PretrainTrainer:
                 except Exception as e:
                     logging.warning(f"Error in validation batch {batch_idx}: {e}")
                     continue
-                    
-        # # 🧹 Clear memory again after validation ends
-        # gc.collect()
-        # torch.cuda.empty_cache()
         
         self.model.train()
         
@@ -493,8 +494,3 @@ class PretrainTrainer:
         logging.info(f"Resumed from step {self.global_step}")
         
         return checkpoint_info
-
-
-
-
-
