@@ -186,7 +186,7 @@ def get_args():
                        help="Data format")
     parser.add_argument("--max_seq_length", type=int, default=2048,
                        help="Maximum sequence length")
-    parser.add_argument("--dataloader_num_workers", type=int, default=0,
+    parser.add_argument("--dataloader_num_workers", type=int, default=4,
                        help="Number of DataLoader worker processes")
     
     # Streaming dataset configuration
@@ -735,6 +735,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
