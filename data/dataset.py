@@ -375,10 +375,16 @@ class StreamingINDRADataset(IterableDataset):
             text = str(item[self.text_column]).strip()
             if len(text) >= self.min_length:
                 processed_item = {'text': text}
-                # Copy other fields
+                # Copy other fields, but skip problematic ones
                 for key, value in item.items():
-                    if key != self.text_column:
-                        processed_item[key] = value
+                    if key != self.text_column and key not in ['veda', 'vedic']:  # Skip problematic keys
+                        try:
+                            # Only copy JSON-serializable values
+                            if isinstance(value, (str, int, float, bool, list, dict, type(None))):
+                                processed_item[key] = value
+                        except:
+                            # Skip any problematic values
+                            continue
                 return processed_item
                 
         # Try common text fields
