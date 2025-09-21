@@ -1,5 +1,6 @@
 """
 Hybrid pre-training with direct knowledge transfer from teacher model (Qwen1.5-MoE)
+Modified to use streaming datasets for memory efficiency
 (c) Divyansh Bharadwaj
 """
 
@@ -24,13 +25,14 @@ class HybridPretrainTrainer(PretrainTrainer):
     Hybrid pre-training trainer combining:
     1. Direct Knowledge Transfer: Initializing from pre-trained teacher model
     2. Knowledge Distillation: Training to mimic teacher's output distribution
+    Modified to use streaming datasets for memory efficiency
     """
     
     def __init__(
         self,
         model: INDRATransformer,
         config,
-        train_dataset,
+        train_dataset,  # Now expects StreamingINDRADataset or StreamingVedicDataset
         val_dataset=None,
         tokenizer=None,
         teacher_model_path: str = "Qwen/Qwen1.5-MoE-A2.7B",
@@ -41,15 +43,12 @@ class HybridPretrainTrainer(PretrainTrainer):
         Args:
             model: Student INDRA model
             config: Training configuration
-            train_dataset: Training dataset
-            val_dataset: Validation dataset
+            train_dataset: Streaming training dataset
+            val_dataset: Streaming validation dataset
             tokenizer: Tokenizer instance
             teacher_model_path: Path/name of teacher model
         """
-        # Initialize parent trainer
-        super().__init__(model, config, train_dataset, val_dataset, tokenizer)
-        
-        # Teacher model configuration
+        # Teacher model configuration (setup before parent init)
         self.teacher_model_path = teacher_model_path
         self.use_direct_transfer = config.use_direct_transfer
         self.distillation_alpha = config.distillation_alpha
@@ -63,6 +62,9 @@ class HybridPretrainTrainer(PretrainTrainer):
         # Setup teacher model and knowledge transfer
         self._setup_teacher_model()
         
+        # Initialize parent trainer
+        super().__init__(model, config, train_dataset, val_dataset, tokenizer)
+        
         if self.use_direct_transfer:
             self._perform_direct_transfer()
         
@@ -72,6 +74,7 @@ class HybridPretrainTrainer(PretrainTrainer):
         logging.info(f"Hybrid trainer initialized with teacher: {teacher_model_path}")
         logging.info(f"Direct transfer: {self.use_direct_transfer}")
         logging.info(f"Distillation alpha: {self.distillation_alpha}")
+        logging.info(f"Using streaming dataset with {train_dataset.total_files} files")
     
     def _setup_teacher_model(self):
         """Load and setup teacher model."""
@@ -84,7 +87,7 @@ class HybridPretrainTrainer(PretrainTrainer):
             # Load teacher model
             self.teacher_model = AutoModel.from_pretrained(
                 self.teacher_model_path,
-                torch_dtype=torch.float16 if self.config.use_fp16 else torch.bfloat16,
+                torch_dtype=torch.float16,
                 device_map="auto" if torch.cuda.device_count() > 1 else None,
                 trust_remote_code=True,
             )
@@ -97,7 +100,7 @@ class HybridPretrainTrainer(PretrainTrainer):
             
             # Move teacher to device and set to eval mode
             if torch.cuda.device_count() <= 1:
-                self.teacher_model = self.teacher_model.to(self.device)
+                self.teacher_model = self.teacher_model.to(self.device if hasattr(self, 'device') else torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
             
             self.teacher_model.eval()
             
@@ -467,109 +470,181 @@ class HybridPretrainTrainer(PretrainTrainer):
         return student_input_ids
     
     def _train_step(self, batch: Dict[str, torch.Tensor]) -> float:
-        """Single training step with hybrid loss."""
-        # Move batch to device
-        batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                for k, v in batch.items()}
-        
-        # Get teacher outputs for distillation
-        teacher_logits = None
-        if self.distillation_alpha < 1.0 and self.teacher_model is not None:
-            teacher_logits = self._get_teacher_outputs(batch)
-        
-        # Forward pass with mixed precision
-        with autocast(dtype=self.amp_dtype, enabled=self.use_amp):
-##        with autocast(enabled=self.use_amp, dtype=self.amp_dtype):
-            outputs = self.model(
-                input_ids=batch['input_ids'],
-                attention_mask=batch.get('attention_mask'),
-                labels=batch.get('labels'),
-                compute_vedic_rewards=True
-            )
+        """Single training step with hybrid loss and streaming dataset batch."""
+        try:
+            # Move batch to device
+            batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                    for k, v in batch.items()}
             
-            # Standard language modeling loss
-            lm_loss = outputs['loss']
+            # Get teacher outputs for distillation
+            teacher_logits = None
+            if self.distillation_alpha < 1.0 and self.teacher_model is not None:
+                try:
+                    teacher_logits = self._get_teacher_outputs(batch)
+                except Exception as e:
+                    logging.warning(f"Failed to get teacher outputs: {e}")
             
-            # Compute distillation loss
-            distillation_loss = 0.0
-            if teacher_logits is not None:
-                student_logits = outputs['logits']
-                
-                # Align dimensions if necessary
-                if student_logits.shape[-1] != teacher_logits.shape[-1]:
-                    # Truncate to smaller vocabulary
-                    min_vocab = min(student_logits.shape[-1], teacher_logits.shape[-1])
-                    student_logits = student_logits[..., :min_vocab]
-                    teacher_logits = teacher_logits[..., :min_vocab]
-                
-                distillation_loss = self._compute_distillation_loss(
-                    student_logits, teacher_logits
+            # Forward pass with mixed precision
+            use_autocast = (self.use_amp and torch.cuda.is_available())
+            
+            if use_autocast:
+                with autocast(dtype=self.amp_dtype, enabled=self.use_amp):
+                    outputs = self.model(
+                        input_ids=batch['input_ids'],
+                        attention_mask=batch.get('attention_mask'),
+                        labels=batch.get('labels'),
+                        compute_vedic_rewards=True
+                    )
+                    
+                    # Standard language modeling loss
+                    lm_loss = outputs['loss']
+                    
+                    # Compute distillation loss
+                    distillation_loss = 0.0
+                    if teacher_logits is not None:
+                        student_logits = outputs['logits']
+                        
+                        # Align dimensions if necessary
+                        if student_logits.shape[-1] != teacher_logits.shape[-1]:
+                            # Truncate to smaller vocabulary
+                            min_vocab = min(student_logits.shape[-1], teacher_logits.shape[-1])
+                            student_logits = student_logits[..., :min_vocab]
+                            teacher_logits = teacher_logits[..., :min_vocab]
+                        
+                        distillation_loss = self._compute_distillation_loss(
+                            student_logits, teacher_logits
+                        )
+                    
+                    # Combine losses
+                    total_loss = (
+                        self.distillation_alpha * lm_loss + 
+                        self.distillation_loss_weight * distillation_loss
+                    )
+            else:
+                outputs = self.model(
+                    input_ids=batch['input_ids'],
+                    attention_mask=batch.get('attention_mask'),
+                    labels=batch.get('labels'),
+                    compute_vedic_rewards=True
                 )
-            
-            # Combine losses
-            total_loss = (
-                self.distillation_alpha * lm_loss + 
-                self.distillation_loss_weight * distillation_loss
-            )
+                
+                # Standard language modeling loss
+                lm_loss = outputs['loss']
+                
+                # Compute distillation loss
+                distillation_loss = 0.0
+                if teacher_logits is not None:
+                    student_logits = outputs['logits']
+                    
+                    # Align dimensions if necessary
+                    if student_logits.shape[-1] != teacher_logits.shape[-1]:
+                        # Truncate to smaller vocabulary
+                        min_vocab = min(student_logits.shape[-1], teacher_logits.shape[-1])
+                        student_logits = student_logits[..., :min_vocab]
+                        teacher_logits = teacher_logits[..., :min_vocab]
+                    
+                    distillation_loss = self._compute_distillation_loss(
+                        student_logits, teacher_logits
+                    )
+                
+                # Combine losses
+                total_loss = (
+                    self.distillation_alpha * lm_loss + 
+                    self.distillation_loss_weight * distillation_loss
+                )
             
             # Scale loss for gradient accumulation
             total_loss = total_loss / self.config.gradient_accumulation_steps
-        
-        # Backward pass
-        if self.use_amp:
-            self.scaler.scale(total_loss).backward()
-        else:
-            total_loss.backward()
-        
-        # Gradient accumulation
-        if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
-            # Gradient clipping
-            if self.use_amp:
-                self.scaler.unscale_(self.optimizer)
             
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), 
-                self.config.pretrain.grad_clip
-            )
-            
-            # Optimizer step
+            # Backward pass
             if self.use_amp:
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                self.scaler.scale(total_loss).backward()
             else:
-                self.optimizer.step()
+                total_loss.backward()
             
-            self.scheduler.step()
-            self.optimizer.zero_grad()
-        
-        # Return individual loss components for logging
-        return {
-            'total_loss': total_loss.item() * self.config.gradient_accumulation_steps,
-            'lm_loss': lm_loss.item(),
-            'distillation_loss': distillation_loss.item() if isinstance(distillation_loss, torch.Tensor) else distillation_loss
-        }
+            # Gradient accumulation
+            if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
+                # Gradient clipping
+                if self.use_amp:
+                    self.scaler.unscale_(self.optimizer)
+                
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), 
+                    self.config.pretrain.grad_clip
+                )
+                
+                # Optimizer step
+                if self.use_amp:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+                
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+            
+            # Return individual loss components for logging
+            return {
+                'total_loss': total_loss.item() * self.config.gradient_accumulation_steps,
+                'lm_loss': lm_loss.item() if isinstance(lm_loss, torch.Tensor) else lm_loss,
+                'distillation_loss': distillation_loss.item() if isinstance(distillation_loss, torch.Tensor) else distillation_loss
+            }
+
+        except Exception as e:
+            logging.error(f"Error in hybrid training step: {e}")
+            # For streaming, we can skip this batch and continue
+            return {
+                'total_loss': 0.0,
+                'lm_loss': 0.0,
+                'distillation_loss': 0.0
+            }
     
     def _train_epoch(self) -> float:
-        """Train for one epoch with hybrid losses."""
+        """Train for one epoch with hybrid losses and streaming datasets."""
         epoch_losses = {'total_loss': 0.0, 'lm_loss': 0.0, 'distillation_loss': 0.0}
         num_batches = 0
         
+        # Streaming datasets provide infinite iteration until we break
         for batch_idx, batch in enumerate(self.train_loader):
             if self.global_step >= self.config.max_steps:
+                logging.info(f"Reached max steps ({self.config.max_steps}), stopping training")
                 break
             
-            losses = self._train_step(batch)
-            
-            for key, value in losses.items():
-                epoch_losses[key] += value
-            
-            num_batches += 1
-            
-            # Logging
-            if self.global_step % self.config.logging_steps == 0:
-                self._log_hybrid_metrics(losses)
-            
-            self.global_step += 1
+            try:
+                losses = self._train_step(batch)
+                
+                for key, value in losses.items():
+                    epoch_losses[key] += value
+                
+                num_batches += 1
+                
+                # Logging
+                if self.global_step % self.config.logging_steps == 0:
+                    self._log_hybrid_metrics(losses)
+                
+                # Update curriculum phase
+                self._update_curriculum_phase()
+
+                # Validation
+                if self.val_loader and self.global_step > 0 and self.global_step % self.config.eval_steps == 0:
+                    val_metrics = self._validate()
+                    self.metrics_tracker.update(val_metrics, self.global_step)
+                    
+                    logging.info(f"Step {self.global_step}: val_loss={val_metrics.get('val_loss', 0.0):.4f}")
+                    
+                    if self.wandb:
+                        self.wandb.log(val_metrics, step=self.global_step)
+                
+                # Save checkpoint
+                if self.global_step > 0 and self.global_step % self.config.save_steps == 0:
+                    self._save_checkpoint()
+                
+                self.global_step += 1
+                
+            except Exception as e:
+                logging.error(f"Error in training batch {batch_idx}: {e}")
+                # For streaming, we can continue with next batch
+                continue
         
         # Average losses
         for key in epoch_losses:
@@ -578,7 +653,7 @@ class HybridPretrainTrainer(PretrainTrainer):
         return epoch_losses['total_loss']
     
     def _log_hybrid_metrics(self, losses: Dict[str, float]):
-        """Log hybrid training metrics."""
+        """Log hybrid training metrics with streaming dataset info."""
         # Calculate tokens per second
         current_time = time.time()
         if not hasattr(self, '_last_log_time'):
@@ -589,7 +664,7 @@ class HybridPretrainTrainer(PretrainTrainer):
         time_diff = current_time - self._last_log_time
         step_diff = self.global_step - self._last_log_step
         
-        if time_diff > 0:
+        if time_diff > 0 and step_diff > 0:
             tokens_per_sec = TrainerUtils.estimate_tokens_per_second(
                 self.config.batch_size,
                 self.config.max_seq_length,
@@ -605,6 +680,11 @@ class HybridPretrainTrainer(PretrainTrainer):
         # Current learning rate
         current_lr = self.scheduler.get_last_lr()[0]
         
+        # Add streaming-specific metrics
+        streaming_stats = {}
+        if hasattr(self.train_dataset, '_shuffle_buffer'):
+            streaming_stats['buffer_size'] = len(self.train_dataset._shuffle_buffer)
+        
         metrics = {
             'train_total_loss': losses['total_loss'],
             'train_lm_loss': losses['lm_loss'],
@@ -615,8 +695,10 @@ class HybridPretrainTrainer(PretrainTrainer):
             'epoch': self.epoch,
             'curriculum_phase': self.current_phase,
             'distillation_alpha': self.distillation_alpha,
+            'memory_batch_mb': self.train_dataset.batch_size_mb,
         }
         metrics.update(memory_stats)
+        metrics.update(streaming_stats)
         
         # Update tracker
         self.metrics_tracker.update(metrics, self.global_step)
@@ -625,7 +707,8 @@ class HybridPretrainTrainer(PretrainTrainer):
         logging.info(
             f"Step {self.global_step}: total_loss={losses['total_loss']:.4f}, "
             f"lm_loss={losses['lm_loss']:.4f}, distill_loss={losses['distillation_loss']:.4f}, "
-            f"lr={current_lr:.2e}, tokens/s={tokens_per_sec:.0f}, phase={self.current_phase}"
+            f"lr={current_lr:.2e}, tokens/s={tokens_per_sec:.0f}, phase={self.current_phase}, "
+            f"mem_batch={self.train_dataset.batch_size_mb}MB"
         )
         
         # Log to wandb
@@ -634,6 +717,3 @@ class HybridPretrainTrainer(PretrainTrainer):
         
         self._last_log_time = current_time
         self._last_log_step = self.global_step
-
-
-
