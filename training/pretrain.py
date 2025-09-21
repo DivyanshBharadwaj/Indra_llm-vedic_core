@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from .trainer_utils import TrainerUtils, get_optimizer, get_scheduler, MetricsTracker
+from .trainer_utils import TrainerUtils, get_optimizer, get_scheduler, MetricsTracker, StreamingMetricsTracker
 from data import StreamingINDRADataset, StreamingVedicDataset
 from model import INDRATransformer
 
@@ -485,3 +485,4 @@ class PretrainTrainer:
         logging.info(f"Resumed from step {self.global_step}")
         
         return checkpoint_info
+
