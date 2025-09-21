@@ -16,6 +16,122 @@ from torch.optim import AdamW, SGD
 from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, LinearLR
 import wandb
 
+class MetricsTracker:
+    """Track training metrics and statistics."""
+    
+    def __init__(self, window_size: int = 100):
+        self.window_size = window_size
+        self.metrics = {}
+        self.step_counts = {}
+    
+    def update(self, metrics: Dict[str, Any], step: int):
+        """Update metrics for current step."""
+        for key, value in metrics.items():
+            # Only track numeric values in metrics history
+            if isinstance(value, (int, float)):
+                if key not in self.metrics:
+                    self.metrics[key] = []
+                    self.step_counts[key] = []
+                
+                self.metrics[key].append(value)
+                self.step_counts[key].append(step)
+                
+                # Keep only recent values
+                if len(self.metrics[key]) > self.window_size:
+                    self.metrics[key] = self.metrics[key][-self.window_size:]
+                    self.step_counts[key] = self.step_counts[key][-self.window_size:]
+    
+    def get_average(self, key: str, steps: Optional[int] = None) -> float:
+        """Get average value for a metric."""
+        if key not in self.metrics or not self.metrics[key]:
+            return 0.0
+        
+        values = self.metrics[key]
+        if steps is not None:
+            values = values[-steps:]
+        
+        return sum(values) / len(values)
+    
+    def get_latest(self, key: str) -> float:
+        """Get latest value for a metric."""
+        if key not in self.metrics or not self.metrics[key]:
+            return 0.0
+        return self.metrics[key][-1]
+    
+    def get_trend(self, key: str, steps: int = 10) -> str:
+        """Get trend direction for a metric."""
+        if key not in self.metrics or len(self.metrics[key]) < steps:
+            return "insufficient_data"
+        
+        values = self.metrics[key][-steps:]
+        first_half = values[:steps//2]
+        second_half = values[steps//2:]
+        
+        avg_first = sum(first_half) / len(first_half)
+        avg_second = sum(second_half) / len(second_half)
+        
+        diff_ratio = (avg_second - avg_first) / abs(avg_first) if avg_first != 0 else 0
+        
+        if diff_ratio > 0.01:
+            return "increasing"
+        elif diff_ratio < -0.01:
+            return "decreasing"
+        else:
+            return "stable"
+    
+    def get_summary(self) -> Dict[str, Dict[str, float]]:
+        """Get summary of all metrics."""
+        summary = {}
+        for key in self.metrics:
+            if self.metrics[key]:
+                summary[key] = {
+                    'current': self.get_latest(key),
+                    'average': self.get_average(key),
+                    'min': min(self.metrics[key]),
+                    'max': max(self.metrics[key]),
+                    'count': len(self.metrics[key])
+                }
+        return summary
+
+class StreamingMetricsTracker(MetricsTracker):
+    """Enhanced metrics tracker for streaming datasets."""
+    
+    def __init__(self, window_size: int = 100):
+        super().__init__(window_size)
+        self.streaming_stats = {
+            'examples_processed': 0,
+            'batches_processed': 0,
+            'cache_hits': 0,
+            'cache_misses': 0,
+            'buffer_overflows': 0
+        }
+    
+    def update_streaming_stats(self, **kwargs):
+        """Update streaming-specific statistics."""
+        for key, value in kwargs.items():
+            if key in self.streaming_stats:
+                self.streaming_stats[key] += value
+    
+    def get_streaming_summary(self) -> Dict[str, Any]:
+        """Get summary of streaming statistics."""
+        summary = self.get_summary()
+        summary['streaming'] = self.streaming_stats.copy()
+        
+        # Calculate derived metrics
+        if self.streaming_stats['batches_processed'] > 0:
+            summary['streaming']['avg_examples_per_batch'] = (
+                self.streaming_stats['examples_processed'] / 
+                self.streaming_stats['batches_processed']
+            )
+        
+        if (self.streaming_stats['cache_hits'] + self.streaming_stats['cache_misses']) > 0:
+            summary['streaming']['cache_hit_rate'] = (
+                self.streaming_stats['cache_hits'] / 
+                (self.streaming_stats['cache_hits'] + self.streaming_stats['cache_misses'])
+            )
+        
+        return summary
+
 class TrainerUtils:
     """Utility functions for training with streaming dataset support."""
     
@@ -473,6 +589,18 @@ def get_scheduler(
                 # Cosine annealing
                 progress = (current_step - warmup_steps) / (max_steps - warmup_steps)
                 progress = min(1.0, progress)
+                cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
+                return min_lr_ratio + (1 - min_lr_ratio) * cosine_factor
+        
+        return LambdaLR(optimizer, lr_lambda)
+    
+    elif scheduler_name.lower() == "linear":
+        def lr_lambda(current_step: int) -> float:
+            if current_step < warmup_steps:
+                return current_step / warmup_steps
+            else:
+                progress = (current_step - warmup_steps) / (max_steps - warmup_steps)
+                progress = min(1.0, progress)
                 return min_lr_ratio + (1 - min_lr_ratio) * (1 - progress)
         
         return LambdaLR(optimizer, lr_lambda)
@@ -502,131 +630,3 @@ def get_scheduler(
     
     else:
         raise ValueError(f"Unknown scheduler: {scheduler_name}")
-
-class StreamingMetricsTracker(MetricsTracker):
-    """Enhanced metrics tracker for streaming datasets."""
-    
-    def __init__(self, window_size: int = 100):
-        super().__init__(window_size)
-        self.streaming_stats = {
-            'examples_processed': 0,
-            'batches_processed': 0,
-            'cache_hits': 0,
-            'cache_misses': 0,
-            'buffer_overflows': 0
-        }
-    
-    def update_streaming_stats(self, **kwargs):
-        """Update streaming-specific statistics."""
-        for key, value in kwargs.items():
-            if key in self.streaming_stats:
-                self.streaming_stats[key] += value
-    
-    def get_streaming_summary(self) -> Dict[str, Any]:
-        """Get summary of streaming statistics."""
-        summary = self.get_summary()
-        summary['streaming'] = self.streaming_stats.copy()
-        
-        # Calculate derived metrics
-        if self.streaming_stats['batches_processed'] > 0:
-            summary['streaming']['avg_examples_per_batch'] = (
-                self.streaming_stats['examples_processed'] / 
-                self.streaming_stats['batches_processed']
-            )
-        
-        if (self.streaming_stats['cache_hits'] + self.streaming_stats['cache_misses']) > 0:
-            summary['streaming']['cache_hit_rate'] = (
-                self.streaming_stats['cache_hits'] / 
-                (self.streaming_stats['cache_hits'] + self.streaming_stats['cache_misses'])
-            )
-        
-        return summary
-
-class MetricsTracker:
-    """Track training metrics and statistics."""
-    
-    def __init__(self, window_size: int = 100):
-        self.window_size = window_size
-        self.metrics = {}
-        self.step_counts = {}
-    
-    def update(self, metrics: Dict[str, Any], step: int):
-        """Update metrics for current step."""
-        for key, value in metrics.items():
-            # Only track numeric values in metrics history
-            if isinstance(value, (int, float)):
-                if key not in self.metrics:
-                    self.metrics[key] = []
-                    self.step_counts[key] = []
-                
-                self.metrics[key].append(value)
-                self.step_counts[key].append(step)
-                
-                # Keep only recent values
-                if len(self.metrics[key]) > self.window_size:
-                    self.metrics[key] = self.metrics[key][-self.window_size:]
-                    self.step_counts[key] = self.step_counts[key][-self.window_size:]
-    
-    def get_average(self, key: str, steps: Optional[int] = None) -> float:
-        """Get average value for a metric."""
-        if key not in self.metrics or not self.metrics[key]:
-            return 0.0
-        
-        values = self.metrics[key]
-        if steps is not None:
-            values = values[-steps:]
-        
-        return sum(values) / len(values)
-    
-    def get_latest(self, key: str) -> float:
-        """Get latest value for a metric."""
-        if key not in self.metrics or not self.metrics[key]:
-            return 0.0
-        return self.metrics[key][-1]
-    
-    def get_trend(self, key: str, steps: int = 10) -> str:
-        """Get trend direction for a metric."""
-        if key not in self.metrics or len(self.metrics[key]) < steps:
-            return "insufficient_data"
-        
-        values = self.metrics[key][-steps:]
-        first_half = values[:steps//2]
-        second_half = values[steps//2:]
-        
-        avg_first = sum(first_half) / len(first_half)
-        avg_second = sum(second_half) / len(second_half)
-        
-        diff_ratio = (avg_second - avg_first) / abs(avg_first) if avg_first != 0 else 0
-        
-        if diff_ratio > 0.01:
-            return "increasing"
-        elif diff_ratio < -0.01:
-            return "decreasing"
-        else:
-            return "stable"
-    
-    def get_summary(self) -> Dict[str, Dict[str, float]]:
-        """Get summary of all metrics."""
-        summary = {}
-        for key in self.metrics:
-            if self.metrics[key]:
-                summary[key] = {
-                    'current': self.get_latest(key),
-                    'average': self.get_average(key),
-                    'min': min(self.metrics[key]),
-                    'max': max(self.metrics[key]),
-                    'count': len(self.metrics[key])
-                }
-        return summary / (max_steps - warmup_steps)
-                progress = min(1.0, progress)
-                cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
-                return min_lr_ratio + (1 - min_lr_ratio) * cosine_factor
-        
-        return LambdaLR(optimizer, lr_lambda)
-    
-    elif scheduler_name.lower() == "linear":
-        def lr_lambda(current_step: int) -> float:
-            if current_step < warmup_steps:
-                return current_step / warmup_steps
-            else:
-                progress = (current_step - warmup_steps)
