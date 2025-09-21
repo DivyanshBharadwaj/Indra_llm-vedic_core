@@ -194,10 +194,20 @@ class StreamingINDRADataset(IterableDataset):
         """Stream batches of examples from a single file."""
         cache_path = self._get_cache_path(file_path)
         
+        # Determine if this is Vedic content based on file path
+        is_vedic_file = self._is_vedic_file(file_path)
+        
         # Try loading from cache first
         if cache_path and os.path.exists(cache_path):
             cached_examples = self._load_from_cache(cache_path)
             if cached_examples:
+                # Add Vedic metadata to cached examples if needed
+                if is_vedic_file:
+                    for example in cached_examples:
+                        if 'is_vedic' not in example:
+                            example['is_vedic'] = True
+                            example['vedic_source'] = file_path
+                
                 # Yield cached examples in batches
                 for i in range(0, len(cached_examples), self.examples_per_batch):
                     batch = cached_examples[i:i + self.examples_per_batch]
@@ -211,6 +221,13 @@ class StreamingINDRADataset(IterableDataset):
         try:
             if file_type == 'txt':
                 for example in self._stream_txt_file(file_path):
+                    # Add Vedic metadata based on file path
+                    if is_vedic_file:
+                        example['is_vedic'] = True
+                        example['vedic_source'] = file_path
+                    else:
+                        example['is_vedic'] = False
+                    
                     current_batch.append(example)
                     all_examples.append(example)
                     
@@ -220,6 +237,13 @@ class StreamingINDRADataset(IterableDataset):
                         
             elif file_type == 'json':
                 for example in self._stream_json_file(file_path):
+                    # Add Vedic metadata based on file path
+                    if is_vedic_file:
+                        example['is_vedic'] = True
+                        example['vedic_source'] = file_path
+                    else:
+                        example['is_vedic'] = False
+                    
                     current_batch.append(example)
                     all_examples.append(example)
                     
@@ -229,6 +253,13 @@ class StreamingINDRADataset(IterableDataset):
                         
             elif file_type == 'csv':
                 for example in self._stream_csv_file(file_path):
+                    # Add Vedic metadata based on file path
+                    if is_vedic_file:
+                        example['is_vedic'] = True
+                        example['vedic_source'] = file_path
+                    else:
+                        example['is_vedic'] = False
+                    
                     current_batch.append(example)
                     all_examples.append(example)
                     
@@ -238,6 +269,13 @@ class StreamingINDRADataset(IterableDataset):
                         
             elif file_type == 'hf':
                 for example in self._stream_hf_dataset(file_path):
+                    # Add Vedic metadata based on file path
+                    if is_vedic_file:
+                        example['is_vedic'] = True
+                        example['vedic_source'] = file_path
+                    else:
+                        example['is_vedic'] = False
+                    
                     current_batch.append(example)
                     all_examples.append(example)
                     
@@ -259,6 +297,27 @@ class StreamingINDRADataset(IterableDataset):
         # Clean up memory
         del all_examples
         gc.collect()
+    
+    def _is_vedic_file(self, file_path: str) -> bool:
+        """Determine if a file should be considered Vedic based on its path."""
+        # Convert to lowercase for case-insensitive matching
+        normalized_path = file_path.lower().replace('\\', '/')
+        
+        # Check if the file is in vedic_texts directory or similar
+        vedic_indicators = [
+            'vedic_texts',
+            'vedic',
+            'sanskrit',
+            'vedas',
+            'upanishads',
+            'puranas',
+            'mahabharata',
+            'ramayana',
+            'bhagavad_gita',
+            'gita'
+        ]
+        
+        return any(indicator in normalized_path for indicator in vedic_indicators)
     
     def _stream_txt_file(self, path: str) -> Generator[Dict, None, None]:
         """Stream examples from a text file."""
@@ -536,8 +595,11 @@ class StreamingVedicDataset(StreamingINDRADataset):
             if not text:
                 return None
             
+            # Check if this is Vedic content
+            is_vedic = example.get('is_vedic', False)
+            
             # Use Vedic tokenizer if available
-            if hasattr(self.tokenizer, 'encode_vedic_text'):
+            if hasattr(self.tokenizer, 'encode_vedic_text') and is_vedic:
                 token_ids = self.tokenizer.encode_vedic_text(
                     text,
                     add_vedic_markers=self.add_vedic_markers,
@@ -569,20 +631,32 @@ class StreamingVedicDataset(StreamingINDRADataset):
                 )
                 input_ids = encoding['input_ids'].squeeze(0)
                 attention_mask = encoding['attention_mask'].squeeze(0)
-                vedic_weights = torch.ones_like(attention_mask, dtype=torch.float) * self.vedic_weight
+                
+                # Apply Vedic weighting if this is Vedic content
+                if is_vedic:
+                    vedic_weights = torch.ones_like(attention_mask, dtype=torch.float) * self.vedic_weight
+                else:
+                    vedic_weights = torch.ones_like(attention_mask, dtype=torch.float)
             
             result = {
                 'input_ids': input_ids,
                 'attention_mask': attention_mask,
                 'labels': input_ids.clone(),
                 'vedic_weights': vedic_weights,
-                'is_vedic': torch.tensor(1, dtype=torch.long),
+                'is_vedic': torch.tensor(1 if is_vedic else 0, dtype=torch.long),
             }
             
-            # Add metadata
+            # Add metadata (but skip problematic keys)
             for key, value in example.items():
-                if key not in ['text'] and not key.startswith('_'):
-                    result[key] = value
+                if key not in ['text', 'is_vedic'] and not key.startswith('_'):
+                    try:
+                        if isinstance(value, (str, int, float, bool)):
+                            result[key] = value
+                        elif isinstance(value, list) and all(isinstance(x, (str, int, float, bool)) for x in value):
+                            result[key] = value
+                    except:
+                        # Skip any problematic values
+                        continue
             
             return result
             
@@ -711,3 +785,45 @@ def create_streaming_dataset(
         return StreamingInstructionDataset(data_path, tokenizer, **common_args)
     else:
         return StreamingINDRADataset(data_path, tokenizer, **common_args)
+
+def safe_collate_fn(batch):
+    """
+    Custom collate function that handles inconsistent dict keys safely.
+    """
+    if not batch:
+        return {}
+    
+    # Get all possible keys from all examples
+    all_keys = set()
+    for example in batch:
+        if isinstance(example, dict):
+            all_keys.update(example.keys())
+    
+    # Create the collated batch
+    collated = {}
+    
+    for key in all_keys:
+        values = []
+        for example in batch:
+            if isinstance(example, dict) and key in example:
+                values.append(example[key])
+            else:
+                # Skip this example for this key if it doesn't have it
+                continue
+        
+        if values:
+            # Only collate if we have values
+            try:
+                if isinstance(values[0], torch.Tensor):
+                    collated[key] = torch.stack(values)
+                elif isinstance(values[0], (int, float)):
+                    collated[key] = torch.tensor(values)
+                elif isinstance(values[0], str):
+                    collated[key] = values  # Keep as list for strings
+                else:
+                    collated[key] = values  # Keep as list for other types
+            except Exception as e:
+                # If collation fails, keep as list
+                collated[key] = values
+    
+    return collated
