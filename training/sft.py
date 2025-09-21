@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.cuda.amp import GradScaler, autocast
 
-from .trainer_utils import TrainerUtils, get_optimizer, get_scheduler, MetricsTracker
+from .trainer_utils import TrainerUtils, get_optimizer, get_scheduler, MetricsTracker, StreamingMetricsTracker
 from data import StreamingInstructionDataset
 from model import INDRATransformer
 
@@ -548,3 +548,4 @@ class SFTTrainer:
         results['response_rate'] = non_empty_count / max(len(response_lengths), 1)
         
         return results
+
