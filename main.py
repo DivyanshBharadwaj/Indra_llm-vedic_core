@@ -1,5 +1,6 @@
 """
 Main entry point for INDRA LLM - Vedic-aligned Decoder-only Transformer
+Modified to use streaming datasets for memory efficiency
 (c) Divyansh Bharadwaj
 """
 
@@ -20,7 +21,7 @@ sys.path.insert(0, str(project_root))
 from config import ModelConfig, TrainingConfig
 from model import INDRATransformer, add_hierarchical_reasoning_to_model
 from tokenization import SentencePieceTokenizer, VedicTokenizer, VedicTokenizerManager
-from data import INDRADataset, VedicDataset, MultiLanguageDataset, InstructionDataset
+from data import create_streaming_dataset  # Import streaming dataset creator
 from training import PretrainTrainer, HybridPretrainTrainer, SFTTrainer, RLHFTrainer
 from inference import InferenceEngine, VedicInferenceEngine
 from evaluation import Evaluator, VedicEvaluator
@@ -28,7 +29,7 @@ from evaluation import Evaluator, VedicEvaluator
 def debug_data_pipeline(args, train_dataset_obj):
     """A helper function to debug the data loading process."""
     print("\n" + "="*50)
-    print("--- DATA PIPELINE DEBUGGER (v2) ---")
+    print("--- STREAMING DATA PIPELINE DEBUGGER ---")
     
     # 1. Check paths from command-line arguments
     train_path = args.train_data[0] if args.train_data else "Not Provided"
@@ -51,15 +52,21 @@ def debug_data_pipeline(args, train_dataset_obj):
         print(f"    -> ERROR: Path DOES NOT EXIST.")
 
     # 2. Check the created dataset object itself
-    print(f"\n[3] Checking the created Dataset object:")
+    print(f"\n[3] Checking the created Streaming Dataset object:")
     if train_dataset_obj:
         try:
-            num_examples = len(train_dataset_obj)
-            print(f"    -> The created dataset reports it has {num_examples} examples.")
-            if num_examples < 10:
-                print("    -> WARNING: The number of examples is extremely small for pre-training.")
+            print(f"    -> Dataset type: {type(train_dataset_obj).__name__}")
+            print(f"    -> Total files to process: {train_dataset_obj.total_files}")
+            print(f"    -> Batch size (MB): {train_dataset_obj.batch_size_mb}")
+            print(f"    -> Examples per batch: {train_dataset_obj.examples_per_batch}")
+            
+            # Test iterator (just peek at first item)
+            iterator = iter(train_dataset_obj)
+            first_item = next(iterator)
+            print(f"    -> Successfully created iterator and got first item")
+            print(f"    -> First item keys: {list(first_item.keys()) if isinstance(first_item, dict) else 'Not a dict'}")
         except Exception as e:
-            print(f"    -> Could not determine the length of the dataset object. Error: {e}")
+            print(f"    -> Could not test streaming dataset. Error: {e}")
     else:
         print("    -> The created dataset object is None.")
 
@@ -78,7 +85,7 @@ def get_args():
     # Model configuration
     parser.add_argument("--model_config", type=str, default="config.yml",
                        help="Path to model configuration file")
-    parser.add_argument("--vocab_size", type=int, default=262154, ## <========== Orignal: 50275
+    parser.add_argument("--vocab_size", type=int, default=262154,
                        help="Vocabulary size")
     parser.add_argument("--n_positions", type=int, default=2048,
                        help="Maximum sequence length")
@@ -178,13 +185,21 @@ def get_args():
     parser.add_argument("--max_seq_length", type=int, default=2048,
                        help="Maximum sequence length")
     
+    # Streaming dataset configuration
+    parser.add_argument("--batch_size_mb", type=float, default=5.0,
+                       help="Memory batch size in MB for streaming")
+    parser.add_argument("--cache_dir", type=str, default="./cache",
+                       help="Cache directory for processed data")
+    parser.add_argument("--shuffle_buffer_size", type=int, default=1000,
+                       help="Size of shuffle buffer for streaming")
+    
     # Tokenizer configuration
     parser.add_argument("--tokenizer_path", type=str,
                        help="Path to trained tokenizer")
     parser.add_argument("--tokenizer_type", type=str, default="vedic",
                        choices=["sentencepiece", "vedic"],
                        help="Tokenizer type")
-    parser.add_argument("--tokenizer_vocab_size", type=int, default=262154, ## <========== Orignal: 75000
+    parser.add_argument("--tokenizer_vocab_size", type=int, default=262154,
                        help="Tokenizer vocabulary size")
     
     # Teacher model configuration (for hybrid training)
@@ -326,7 +341,7 @@ def create_tokenizer(args):
     """Create tokenizer based on configuration."""
     if args.tokenizer_type == "vedic":
         manager = VedicTokenizerManager(
-            base_dir="./tokenizers", ## <==== ORIGNAL: "./tokenizers"
+            base_dir="./tokenizers",
             gemma_dir="gemma3_indra_tokenizer"
         )
         tokenizer = manager.load_or_create(vocab_size=args.tokenizer_vocab_size)
@@ -338,30 +353,11 @@ def create_tokenizer(args):
     return tokenizer
 
 def create_datasets(args, tokenizer):
-    """Create training and validation datasets."""
+    """Create training and validation datasets using streaming implementation."""
     train_dataset = None
     val_dataset = None
     
-    # if args.train_data:
-    #     if args.vedic_data:
-    #         # Create Vedic dataset
-    #         train_dataset = VedicDataset(
-    #             data_path=args.vedic_data,
-    #             tokenizer=tokenizer,
-    #             max_length=args.max_seq_length,
-    #             data_type=args.data_type,
-    #         )
-    #     else:
-    #         # Create standard dataset
-    #         train_dataset = INDRADataset(
-    #             data_path=args.train_data,
-    #             tokenizer=tokenizer,
-    #             max_length=args.max_seq_length,
-    #             data_type=args.data_type,
-    #         )
-
-    # --- START OF FIX ---
-    # Combine all training data paths into a single list
+    # Combine all training data paths
     all_train_paths = []
     if args.train_data:
         all_train_paths.extend(args.train_data)
@@ -369,36 +365,40 @@ def create_datasets(args, tokenizer):
         all_train_paths.extend(args.vedic_data)
     
     if all_train_paths:
-        # Create a single dataset object that includes all training files
-        # We use VedicDataset to ensure Vedic-specific processing is available
-        train_dataset = VedicDataset(
+        # Determine dataset type based on data
+        dataset_type = "vedic" if args.vedic_data else "base"
+        if args.mode == "sft":
+            dataset_type = "instruction"
+        
+        # Create streaming dataset
+        train_dataset = create_streaming_dataset(
             data_path=all_train_paths,
             tokenizer=tokenizer,
+            dataset_type=dataset_type,
             max_length=args.max_seq_length,
             data_type=args.data_type,
+            batch_size_mb=args.batch_size_mb,
+            cache_dir=args.cache_dir,
+            shuffle_buffer_size=args.shuffle_buffer_size,
+            # Vedic-specific parameters
+            vedic_weight=2.0 if dataset_type == "vedic" else 1.0,
+            preserve_structure=True,
+            add_vedic_markers=True,
         )
-    # --- END OF FIX ---
     
     if args.val_data:
-        val_dataset = INDRADataset(
+        # Create validation dataset (also streaming for consistency)
+        val_dataset = create_streaming_dataset(
             data_path=args.val_data,
             tokenizer=tokenizer,
+            dataset_type="base",
             max_length=args.max_seq_length,
             data_type=args.data_type,
+            batch_size_mb=args.batch_size_mb,
+            cache_dir=args.cache_dir,
+            shuffle_buffer_size=100,  # Smaller for validation
         )
     
-    # 🔑 Preprocessing hook
-    if args.tokenizer_type == "vedic" and train_dataset is not None:
-        manager = VedicTokenizerManager()
-        train_dataset = train_dataset.map(
-            lambda ex: {"text": manager.preprocess_text(ex["text"])}
-        )
-    if args.tokenizer_type == "vedic" and val_dataset is not None:
-        manager = VedicTokenizerManager()
-        val_dataset = val_dataset.map(
-            lambda ex: {"text": manager.preprocess_text(ex["text"])}
-        )
-
     return train_dataset, val_dataset
 
 def train_tokenizer_mode(args):
@@ -435,8 +435,8 @@ def train_tokenizer_mode(args):
     logging.info(f"Tokenizer saved to {output_prefix}")
 
 def pretrain_mode(args):
-    """Pre-training mode."""
-    logging.info("Starting pre-training...")
+    """Pre-training mode with streaming datasets."""
+    logging.info("Starting pre-training with streaming datasets...")
     
     # Create configurations
     model_config = create_model_config(args)
@@ -447,7 +447,6 @@ def pretrain_mode(args):
     train_dataset, val_dataset = create_datasets(args, tokenizer)
 
     debug_data_pipeline(args, train_dataset)
-
     
     if not train_dataset:
         raise ValueError("No training dataset provided")
@@ -479,7 +478,7 @@ def pretrain_mode(args):
 
 def hybrid_pretrain_mode(args):
     """Hybrid pre-training mode with teacher model."""
-    logging.info("Starting hybrid pre-training...")
+    logging.info("Starting hybrid pre-training with streaming datasets...")
     
     # Create configurations
     model_config = create_model_config(args)
@@ -519,8 +518,8 @@ def hybrid_pretrain_mode(args):
     logging.info(f"Hybrid pre-training completed: {results}")
 
 def sft_mode(args):
-    """Supervised fine-tuning mode."""
-    logging.info("Starting supervised fine-tuning...")
+    """Supervised fine-tuning mode with streaming datasets."""
+    logging.info("Starting supervised fine-tuning with streaming datasets...")
     
     # Create configurations
     model_config = create_model_config(args)
@@ -694,12 +693,16 @@ def main():
     # Setup logging
     setup_logging(args.log_level)
     
-    # Create output directory
+    # Create output and cache directories
     os.makedirs(args.output_dir, exist_ok=True)
+    if args.cache_dir:
+        os.makedirs(args.cache_dir, exist_ok=True)
     
     # Log configuration
     logging.info(f"INDRA LLM - Mode: {args.mode}")
     logging.info(f"Output directory: {args.output_dir}")
+    logging.info(f"Cache directory: {args.cache_dir}")
+    logging.info(f"Streaming batch size: {args.batch_size_mb}MB")
     logging.info(f"Using device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
     
     # Route to appropriate mode
@@ -728,4 +731,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
