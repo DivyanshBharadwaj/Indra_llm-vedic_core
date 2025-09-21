@@ -10,7 +10,7 @@ import time
 import logging
 from typing import Dict, Optional, Any
 from pathlib import Path
-
+import gc
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -493,5 +493,6 @@ class PretrainTrainer:
         logging.info(f"Resumed from step {self.global_step}")
         
         return checkpoint_info
+
 
 
