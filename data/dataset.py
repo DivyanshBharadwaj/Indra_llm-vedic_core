@@ -55,6 +55,7 @@ class StreamingINDRADataset(IterableDataset):
         cache_dir: Optional[str] = None,
         shuffle_buffer_size: int = 1000,
         prefetch_factor: int = 2,
+        random_seed: int = 42,  # Add random seed for reproducibility
     ):
         """
         Initialize streaming INDRA dataset.
@@ -93,6 +94,10 @@ class StreamingINDRADataset(IterableDataset):
         self.cache_dir = cache_dir
         self.shuffle_buffer_size = shuffle_buffer_size
         self.prefetch_factor = prefetch_factor
+        self.random_seed = random_seed
+        
+        # Set random seed for reproducibility
+        random.seed(self.random_seed)
         
         # Calculate approximate batch size in number of examples
         # Rough estimate: 1 token ≈ 4 bytes, average text ≈ max_length/2 tokens
