@@ -447,30 +447,33 @@ class TrainerUtils:
         if not checkpoint_dir.exists():
             return
         
-        # Find all checkpoint files
-        checkpoints = []
+        # Find all checkpoint files (both .pt and .safetensors)
+        checkpoints = {}  # step -> list of paths
         for ext in ['.pt', '.safetensors']:
             pattern = f"checkpoint-step-*{ext}"
             for path in checkpoint_dir.glob(pattern):
                 try:
                     step_str = path.stem.split('-step-')[1]
                     step = int(step_str)
-                    checkpoints.append((step, path))
+                    if step not in checkpoints:
+                        checkpoints[step] = []
+                    checkpoints[step].append(path)
                 except (IndexError, ValueError):
                     continue
         
         # Sort by step number
-        checkpoints.sort(key=lambda x: x[0])
+        sorted_steps = sorted(checkpoints.keys())
         
-        # Remove old checkpoints
-        if len(checkpoints) > keep_latest:
-            to_remove = checkpoints[:-keep_latest]
-            for step, path in to_remove:
-                try:
-                    path.unlink()
-                    logging.info(f"Removed old checkpoint: {path}")
-                except Exception as e:
-                    logging.warning(f"Could not remove checkpoint {path}: {e}")
+        # Remove old checkpoints (keep only the latest N)
+        if len(sorted_steps) > keep_latest:
+            steps_to_remove = sorted_steps[:-keep_latest]
+            for step in steps_to_remove:
+                for path in checkpoints[step]:
+                    try:
+                        path.unlink()
+                        logging.info(f"Removed old checkpoint: {path}")
+                    except Exception as e:
+                        logging.warning(f"Could not remove checkpoint {path}: {e}")
     
     @staticmethod
     def estimate_tokens_per_second(
