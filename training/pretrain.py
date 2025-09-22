@@ -414,7 +414,7 @@ class PretrainTrainer:
             return 0.0
     
     def _validate(self) -> Dict[str, float]:
-        """Run validation on streaming validation dataset."""
+        """Run validation on streaming validation dataset with proper memory management."""
         if not self.val_loader:
             return {}
         
@@ -423,44 +423,177 @@ class PretrainTrainer:
         total_loss = 0.0
         total_aux_loss = 0.0
         total_vedic_loss = 0.0
-        num_batches = 0
-        max_val_batches = 100  # Limit validation batches for streaming
+        num_examples = 0
+        max_val_batches = 20  # Limit validation batches for streaming
+        max_examples_per_batch = 4  # Process only small chunks at a time
         
         with torch.no_grad():
-            for batch_idx, batch in enumerate(self.val_loader):
+            for batch_idx, streaming_batch in enumerate(self.val_loader):
                 if batch_idx >= max_val_batches:
                     break
                 
                 try:
-                    # Move batch to device
-                    batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                            for k, v in batch.items()}
+                    # If streaming_batch is a dict with individual examples, convert to list
+                    if isinstance(streaming_batch, dict):
+                        # Extract individual examples from the collated batch
+                        batch_size = len(next(iter(streaming_batch.values())))
+                        examples = []
+                        for i in range(batch_size):
+                            example = {}
+                            for key, values in streaming_batch.items():
+                                if isinstance(values, torch.Tensor):
+                                    example[key] = values[i:i+1]  # Keep batch dimension
+                                else:
+                                    example[key] = values[i] if isinstance(values, list) else values
+                            examples.append(example)
+                    else:
+                        examples = streaming_batch if isinstance(streaming_batch, list) else [streaming_batch]
                     
-                    # Forward pass
-                    with autocast(dtype=self.amp_dtype, enabled=self.use_amp):
-                        outputs = self.model(
-                            input_ids=batch['input_ids'],
-                            attention_mask=batch.get('attention_mask'),
-                            labels=batch.get('labels'),
-                            compute_vedic_rewards=True
-                        )
+                    # Process examples in small chunks to avoid OOM
+                    for chunk_start in range(0, len(examples), max_examples_per_batch):
+                        chunk_end = min(chunk_start + max_examples_per_batch, len(examples))
+                        chunk_examples = examples[chunk_start:chunk_end]
+                        
+                        if not chunk_examples:
+                            continue
+                        
+                        # Manually collate the chunk
+                        chunk_batch = self._collate_chunk(chunk_examples)
+                        if not chunk_batch:
+                            continue
+                        
+                        # Move chunk to device
+                        chunk_batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                                     for k, v in chunk_batch.items()}
+                        
+                        try:
+                            # Forward pass with memory management
+                            torch.cuda.empty_cache()  # Clear cache before validation
+                            
+                            with autocast(dtype=self.amp_dtype, enabled=self.use_amp):
+                                outputs = self.model(
+                                    input_ids=chunk_batch['input_ids'],
+                                    attention_mask=chunk_batch.get('attention_mask'),
+                                    labels=chunk_batch.get('labels'),
+                                    compute_vedic_rewards=True
+                                )
+                            
+                            chunk_size = chunk_batch['input_ids'].size(0)
+                            total_loss += outputs['loss'].item() * chunk_size
+                            total_aux_loss += outputs.get('aux_losses', {}).get('total_aux_loss', 0.0) * chunk_size
+                            total_vedic_loss += outputs.get('aux_losses', {}).get('vedic_alignment_loss', 0.0) * chunk_size
+                            num_examples += chunk_size
+                            
+                            # Clear memory after each chunk
+                            del outputs, chunk_batch
+                            torch.cuda.empty_cache()
+                            
+                        except RuntimeError as e:
+                            if "out of memory" in str(e):
+                                logging.warning(f"Validation chunk OOM, reducing to single examples")
+                                torch.cuda.empty_cache()
+                                
+                                # Try processing one example at a time
+                                for single_example in chunk_examples:
+                                    try:
+                                        single_batch = self._collate_chunk([single_example])
+                                        if not single_batch:
+                                            continue
+                                        
+                                        single_batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                                                      for k, v in single_batch.items()}
+                                        
+                                        with autocast(dtype=self.amp_dtype, enabled=self.use_amp):
+                                            outputs = self.model(
+                                                input_ids=single_batch['input_ids'],
+                                                attention_mask=single_batch.get('attention_mask'),
+                                                labels=single_batch.get('labels'),
+                                                compute_vedic_rewards=True
+                                            )
+                                        
+                                        total_loss += outputs['loss'].item()
+                                        total_aux_loss += outputs.get('aux_losses', {}).get('total_aux_loss', 0.0)
+                                        total_vedic_loss += outputs.get('aux_losses', {}).get('vedic_alignment_loss', 0.0)
+                                        num_examples += 1
+                                        
+                                        del outputs, single_batch
+                                        torch.cuda.empty_cache()
+                                        
+                                    except Exception as single_e:
+                                        logging.warning(f"Single example validation failed: {single_e}")
+                                        continue
+                            else:
+                                raise e
+                        
+                        # Stop if we've processed enough examples
+                        if num_examples >= 100:  # Reasonable validation set size
+                            break
                     
-                    total_loss += outputs['loss'].item()
-                    total_aux_loss += outputs.get('aux_losses', {}).get('total_aux_loss', 0.0)
-                    total_vedic_loss += outputs.get('aux_losses', {}).get('vedic_alignment_loss', 0.0)
-                    num_batches += 1
-                    
+                    if num_examples >= 100:
+                        break
+                        
                 except Exception as e:
                     logging.warning(f"Error in validation batch {batch_idx}: {e}")
+                    torch.cuda.empty_cache()
                     continue
         
+        # Clear cache and switch back to train mode
+        torch.cuda.empty_cache()
         self.model.train()
         
+        if num_examples == 0:
+            logging.warning("No validation examples processed successfully")
+            return {
+                'val_loss': 0.0,
+                'val_aux_loss': 0.0,
+                'val_vedic_loss': 0.0,
+            }
+        
         return {
-            'val_loss': total_loss / max(num_batches, 1),
-            'val_aux_loss': total_aux_loss / max(num_batches, 1),
-            'val_vedic_loss': total_vedic_loss / max(num_batches, 1),
+            'val_loss': total_loss / num_examples,
+            'val_aux_loss': total_aux_loss / num_examples,
+            'val_vedic_loss': total_vedic_loss / num_examples,
         }
+    
+    def _collate_chunk(self, examples: List[Dict]) -> Dict[str, torch.Tensor]:
+        """Safely collate a small chunk of examples."""
+        if not examples:
+            return {}
+        
+        # Get all possible keys from all examples
+        all_keys = set()
+        for example in examples:
+            if isinstance(example, dict):
+                all_keys.update(example.keys())
+        
+        # Create the collated batch
+        collated = {}
+        
+        for key in all_keys:
+            values = []
+            for example in examples:
+                if isinstance(example, dict) and key in example:
+                    values.append(example[key])
+            
+            if values:
+                try:
+                    if isinstance(values[0], torch.Tensor):
+                        # Handle different tensor shapes gracefully
+                        if all(v.shape == values[0].shape for v in values):
+                            collated[key] = torch.stack(values)
+                        else:
+                            # Skip tensors with mismatched shapes
+                            continue
+                    elif isinstance(values[0], (int, float)):
+                        collated[key] = torch.tensor(values)
+                    else:
+                        collated[key] = values  # Keep as list for other types
+                except Exception as e:
+                    # If collation fails, skip this key
+                    logging.debug(f"Failed to collate key {key}: {e}")
+                    continue
+        
+        return collated
     
     def _log_metrics(self, loss: float):
         """Log training metrics with streaming dataset info."""
