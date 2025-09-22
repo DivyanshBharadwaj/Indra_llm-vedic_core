@@ -196,6 +196,8 @@ def get_args():
                        help="Cache directory for processed data")
     parser.add_argument("--shuffle_buffer_size", type=int, default=1000,
                        help="Size of shuffle buffer for streaming")
+    parser.add_argument("--random_seed", type=int, default=42,
+                       help="Random seed for reproducible training")
     
     # Tokenizer configuration
     parser.add_argument("--tokenizer_path", type=str,
@@ -737,6 +739,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
