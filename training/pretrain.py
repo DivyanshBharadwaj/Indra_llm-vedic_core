@@ -8,7 +8,7 @@ import os
 import glob
 import time
 import logging
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, list
 from pathlib import Path
 
 import torch
@@ -697,3 +697,4 @@ class PretrainTrainer:
         logging.info(f"Resumed from step {self.global_step}")
         
         return checkpoint_info
+
