@@ -440,6 +440,8 @@ class TrainerUtils:
             logging.error("SafeTensors not available for loading checkpoint")
             raise
     
+    # In trainer_utils.py, replace the cleanup_checkpoints method with:
+
     @staticmethod
     def cleanup_checkpoints(checkpoint_dir: str, keep_latest: int = 5):
         """Clean up old checkpoints, keeping only the latest ones."""
@@ -447,7 +449,7 @@ class TrainerUtils:
         if not checkpoint_dir.exists():
             return
         
-        # Find all checkpoint files (both .pt and .safetensors)
+        # Find all checkpoint files grouped by step
         checkpoints = {}  # step -> list of paths
         for ext in ['.pt', '.safetensors']:
             pattern = f"checkpoint-step-*{ext}"
@@ -461,10 +463,8 @@ class TrainerUtils:
                 except (IndexError, ValueError):
                     continue
         
-        # Sort by step number
+        # Sort by step number and remove old ones
         sorted_steps = sorted(checkpoints.keys())
-        
-        # Remove old checkpoints (keep only the latest N)
         if len(sorted_steps) > keep_latest:
             steps_to_remove = sorted_steps[:-keep_latest]
             for step in steps_to_remove:
@@ -633,3 +633,4 @@ def get_scheduler(
     
     else:
         raise ValueError(f"Unknown scheduler: {scheduler_name}")
+
