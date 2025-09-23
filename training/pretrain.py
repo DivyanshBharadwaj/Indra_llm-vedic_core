@@ -433,38 +433,53 @@ class PretrainTrainer:
                     break
                 
                 try:
-                    # If streaming_batch is a dict with individual examples, convert to list
-                    if isinstance(streaming_batch, dict):
-                        # Extract individual examples from the collated batch
-                        batch_size = len(next(iter(streaming_batch.values())))
-                        examples = []
-                        for i in range(batch_size):
-                            example = {}
-                            for key, values in streaming_batch.items():
-                                if isinstance(values, torch.Tensor):
-                                    example[key] = values[i:i+1]  # Keep batch dimension
-                                else:
-                                    example[key] = values[i] if isinstance(values, list) else values
-                            examples.append(example)
-                    else:
-                        examples = streaming_batch if isinstance(streaming_batch, list) else [streaming_batch]
+                    # Handle streaming batch - it should be a dictionary from the collate function
+                    if not isinstance(streaming_batch, dict):
+                        logging.warning(f"Unexpected batch type: {type(streaming_batch)}")
+                        continue
+                    
+                    if not streaming_batch:
+                        logging.warning("Empty batch received")
+                        continue
+                    
+                    # Get batch size from one of the tensor fields
+                    batch_size = 0
+                    for key, values in streaming_batch.items():
+                        if isinstance(values, torch.Tensor) and len(values.shape) > 0:
+                            batch_size = values.shape[0]
+                            break
+                        elif isinstance(values, list):
+                            batch_size = len(values)
+                            break
+                    
+                    if batch_size == 0:
+                        logging.warning("Could not determine batch size")
+                        continue
                     
                     # Process examples in small chunks to avoid OOM
-                    for chunk_start in range(0, len(examples), max_examples_per_batch):
-                        chunk_end = min(chunk_start + max_examples_per_batch, len(examples))
-                        chunk_examples = examples[chunk_start:chunk_end]
+                    for chunk_start in range(0, batch_size, max_examples_per_batch):
+                        chunk_end = min(chunk_start + max_examples_per_batch, batch_size)
                         
-                        if not chunk_examples:
-                            continue
+                        # Extract chunk from the batch
+                        chunk_batch = {}
+                        for key, values in streaming_batch.items():
+                            if isinstance(values, torch.Tensor):
+                                chunk_batch[key] = values[chunk_start:chunk_end]
+                            elif isinstance(values, list):
+                                chunk_batch[key] = values[chunk_start:chunk_end]
+                            else:
+                                chunk_batch[key] = values
                         
-                        # Manually collate the chunk
-                        chunk_batch = self._collate_chunk(chunk_examples)
-                        if not chunk_batch:
+                        if not chunk_batch or not any(isinstance(v, torch.Tensor) for v in chunk_batch.values()):
                             continue
                         
                         # Move chunk to device
-                        chunk_batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                                     for k, v in chunk_batch.items()}
+                        try:
+                            chunk_batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
+                                         for k, v in chunk_batch.items()}
+                        except Exception as e:
+                            logging.warning(f"Error moving chunk to device: {e}")
+                            continue
                         
                         try:
                             # Forward pass with memory management
@@ -480,8 +495,13 @@ class PretrainTrainer:
                             
                             chunk_size = chunk_batch['input_ids'].size(0)
                             total_loss += outputs['loss'].item() * chunk_size
-                            total_aux_loss += outputs.get('aux_losses', {}).get('total_aux_loss', 0.0) * chunk_size
-                            total_vedic_loss += outputs.get('aux_losses', {}).get('vedic_alignment_loss', 0.0) * chunk_size
+                            
+                            # Safely get auxiliary losses
+                            aux_losses = outputs.get('aux_losses', {})
+                            if isinstance(aux_losses, dict):
+                                total_aux_loss += aux_losses.get('total_aux_loss', 0.0) * chunk_size
+                                total_vedic_loss += aux_losses.get('vedic_alignment_loss', 0.0) * chunk_size
+                            
                             num_examples += chunk_size
                             
                             # Clear memory after each chunk
@@ -490,15 +510,23 @@ class PretrainTrainer:
                             
                         except RuntimeError as e:
                             if "out of memory" in str(e):
-                                logging.warning(f"Validation chunk OOM, reducing to single examples")
+                                logging.warning(f"Validation chunk OOM, trying single examples")
                                 torch.cuda.empty_cache()
                                 
                                 # Try processing one example at a time
-                                for single_example in chunk_examples:
+                                for single_idx in range(chunk_start, chunk_end):
+                                    if single_idx >= batch_size:
+                                        break
+                                    
                                     try:
-                                        single_batch = self._collate_chunk([single_example])
-                                        if not single_batch:
-                                            continue
+                                        single_batch = {}
+                                        for key, values in streaming_batch.items():
+                                            if isinstance(values, torch.Tensor):
+                                                single_batch[key] = values[single_idx:single_idx+1]
+                                            elif isinstance(values, list):
+                                                single_batch[key] = [values[single_idx]]
+                                            else:
+                                                single_batch[key] = values
                                         
                                         single_batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
                                                       for k, v in single_batch.items()}
@@ -512,8 +540,10 @@ class PretrainTrainer:
                                             )
                                         
                                         total_loss += outputs['loss'].item()
-                                        total_aux_loss += outputs.get('aux_losses', {}).get('total_aux_loss', 0.0)
-                                        total_vedic_loss += outputs.get('aux_losses', {}).get('vedic_alignment_loss', 0.0)
+                                        aux_losses = outputs.get('aux_losses', {})
+                                        if isinstance(aux_losses, dict):
+                                            total_aux_loss += aux_losses.get('total_aux_loss', 0.0)
+                                            total_vedic_loss += aux_losses.get('vedic_alignment_loss', 0.0)
                                         num_examples += 1
                                         
                                         del outputs, single_batch
@@ -523,7 +553,8 @@ class PretrainTrainer:
                                         logging.warning(f"Single example validation failed: {single_e}")
                                         continue
                             else:
-                                raise e
+                                logging.warning(f"Validation error: {e}")
+                                torch.cuda.empty_cache()
                         
                         # Stop if we've processed enough examples
                         if num_examples >= 100:  # Reasonable validation set size
@@ -697,7 +728,3 @@ class PretrainTrainer:
         logging.info(f"Resumed from step {self.global_step}")
         
         return checkpoint_info
-
-
-
-
