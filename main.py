@@ -181,6 +181,8 @@ def get_args():
                        help="Validation data paths")
     parser.add_argument("--vedic_data", type=str, nargs="+",
                        help="Vedic corpus paths")
+    parser.add_argument("--vedic_val_data", type=str, nargs="+",
+                       help="Vedic validation data paths")
     parser.add_argument("--data_type", type=str, default="auto",
                        choices=["txt", "json", "csv", "hf", "auto"],
                        help="Data format")
@@ -394,21 +396,31 @@ def create_datasets(args, tokenizer):
             add_vedic_markers=True,
         )
     
-    if args.val_data:
-        # Create validation dataset (also streaming for consistency)
+    # Create combined validation dataset from both general and vedic validation data
+    if args.val_data or args.vedic_val_data:
+        all_val_paths = []
+        if args.val_data:
+            all_val_paths.extend(args.val_data)
+        if args.vedic_val_data:
+            all_val_paths.extend(args.vedic_val_data)
+        
+        # Create validation dataset with smaller batch size to avoid OOM
         val_dataset = create_streaming_dataset(
-            data_path=args.val_data,
+            data_path=all_val_paths,
             tokenizer=tokenizer,
-            dataset_type="base",
+            dataset_type="vedic" if args.vedic_val_data else "base",  # Use vedic type if vedic validation data exists
             max_length=args.max_seq_length,
             data_type=args.data_type,
-            batch_size_mb=args.batch_size_mb,
+            batch_size_mb=1.0,  # Much smaller for validation to avoid OOM
             cache_dir=args.cache_dir,
             shuffle_buffer_size=100,  # Smaller for validation
+            vedic_weight=2.0,
+            preserve_structure=True,
+            add_vedic_markers=True,
         )
     
     return train_dataset, val_dataset
-
+    
 def train_tokenizer_mode(args):
     """Train tokenizer on corpus."""
     logging.info("Training tokenizer...")
@@ -739,6 +751,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
