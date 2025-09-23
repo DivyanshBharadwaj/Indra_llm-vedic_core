@@ -441,7 +441,6 @@ class TrainerUtils:
             raise
     
     # In trainer_utils.py, replace the cleanup_checkpoints method with:
-
     @staticmethod
     def cleanup_checkpoints(checkpoint_dir: str, keep_latest: int = 5):
         """Clean up old checkpoints, keeping only the latest ones."""
@@ -633,4 +632,5 @@ def get_scheduler(
     
     else:
         raise ValueError(f"Unknown scheduler: {scheduler_name}")
+
 
