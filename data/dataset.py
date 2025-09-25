@@ -421,9 +421,26 @@ class StreamingINDRADataset(IterableDataset):
         """Process a single JSON item and return processed example or None."""
         if not isinstance(item, dict):
             return None
+        
+        # Handle pre-tokenized format: {"filename": "", "original_text": "", "cleaned_text": "", "tokens": [], "token_count": }
+        if 'tokens' in item and 'cleaned_text' in item:
+            tokens = item.get('tokens', [])
+            cleaned_text = item.get('cleaned_text', '').strip()
+            token_count = item.get('token_count', len(tokens))
+            
+            if tokens and len(tokens) >= self.min_length and cleaned_text:
+                processed_item = {
+                    'text': cleaned_text,
+                    'tokens': tokens,
+                    'token_count': token_count,
+                    'filename': item.get('filename', ''),
+                    'original_text': item.get('original_text', ''),
+                    'is_pretokenized': True
+                }
+                return processed_item
             
         # Handle instruction-response format
-        if self.instruction_column and self.response_column:
+        elif self.instruction_column and self.response_column:
             if self.instruction_column in item and self.response_column in item:
                 instruction = str(item[self.instruction_column]).strip()
                 response = str(item[self.response_column]).strip()
@@ -431,14 +448,15 @@ class StreamingINDRADataset(IterableDataset):
                     return {
                         'instruction': instruction,
                         'response': response,
-                        'text': f"{instruction}\n{response}"
+                        'text': f"{instruction}\n{response}",
+                        'is_pretokenized': False
                     }
                     
         # Handle simple text format
         elif self.text_column in item:
             text = str(item[self.text_column]).strip()
             if len(text) >= self.min_length:
-                processed_item = {'text': text}
+                processed_item = {'text': text, 'is_pretokenized': False}
                 # Copy other fields, but skip problematic ones
                 for key, value in item.items():
                     if key != self.text_column and key not in ['veda', 'vedic']:  # Skip problematic keys
@@ -457,7 +475,7 @@ class StreamingINDRADataset(IterableDataset):
                 if field in item:
                     text = str(item[field]).strip()
                     if len(text) >= self.min_length:
-                        return {'text': text}
+                        return {'text': text, 'is_pretokenized': False}
                         
         return None
     
@@ -537,12 +555,50 @@ class StreamingINDRADataset(IterableDataset):
             logging.error(f"Error in dataset iteration: {e}")
     
     def _tokenize_example(self, example: Dict) -> Optional[Dict[str, torch.Tensor]]:
-        """Tokenize a single example."""
+        """Tokenize example, using pre-tokenized data when available."""
         try:
+            # Handle pre-tokenized data
+            if example.get('is_pretokenized', False) and 'tokens' in example:
+                tokens = example['tokens']
+                if not isinstance(tokens, list):
+                    return None
+                
+                # Convert tokens to tensor and handle length
+                if len(tokens) > self.max_length:
+                    tokens = tokens[:self.max_length]
+                elif len(tokens) < self.max_length:
+                    # Pad with tokenizer's pad_token_id
+                    pad_token_id = getattr(self.tokenizer, 'pad_token_id', 0)
+                    tokens = tokens + [pad_token_id] * (self.max_length - len(tokens))
+                
+                input_ids = torch.tensor(tokens, dtype=torch.long)
+                attention_mask = (input_ids != getattr(self.tokenizer, 'pad_token_id', 0)).long()
+                
+                result = {
+                    'input_ids': input_ids,
+                    'attention_mask': attention_mask,
+                    'labels': input_ids.clone(),
+                }
+                
+                # Add metadata (but skip problematic keys)
+                for key, value in example.items():
+                    if key not in ['text', 'tokens', 'is_pretokenized'] and not key.startswith('_'):
+                        try:
+                            if isinstance(value, (str, int, float, bool)):
+                                result[key] = value
+                            elif isinstance(value, list) and all(isinstance(x, (str, int, float, bool)) for x in value):
+                                result[key] = value
+                        except:
+                            continue
+                
+                return result
+            
+            # Handle regular text that needs tokenization
             text = example.get('text', '')
             if not text:
                 return None
             
+            # Standard tokenization
             encoding = self.tokenizer(
                 text,
                 max_length=self.max_length,
@@ -557,10 +613,16 @@ class StreamingINDRADataset(IterableDataset):
                 'labels': encoding['input_ids'].squeeze(0).clone(),
             }
             
-            # Add metadata
+            # Add metadata (but skip problematic keys)
             for key, value in example.items():
-                if key not in ['text'] and not key.startswith('_'):
-                    result[key] = value
+                if key not in ['text', 'is_pretokenized'] and not key.startswith('_'):
+                    try:
+                        if isinstance(value, (str, int, float, bool)):
+                            result[key] = value
+                        elif isinstance(value, list) and all(isinstance(x, (str, int, float, bool)) for x in value):
+                            result[key] = value
+                    except:
+                        continue
             
             return result
             
@@ -594,16 +656,61 @@ class StreamingVedicDataset(StreamingINDRADataset):
         super().__init__(data_path, tokenizer, **kwargs)
     
     def _tokenize_example(self, example: Dict) -> Optional[Dict[str, torch.Tensor]]:
-        """Tokenize with Vedic-specific processing."""
+        """Tokenize with Vedic-specific processing, supporting pre-tokenized data."""
         try:
+            # Check if this is Vedic content
+            is_vedic = example.get('is_vedic', False)
+            
+            # Handle pre-tokenized data
+            if example.get('is_pretokenized', False) and 'tokens' in example:
+                tokens = example['tokens']
+                if not isinstance(tokens, list):
+                    return None
+                
+                # Convert tokens to tensor and handle length
+                if len(tokens) > self.max_length:
+                    tokens = tokens[:self.max_length]
+                elif len(tokens) < self.max_length:
+                    # Pad with tokenizer's pad_token_id
+                    pad_token_id = getattr(self.tokenizer, 'pad_token_id', 0)
+                    tokens = tokens + [pad_token_id] * (self.max_length - len(tokens))
+                
+                input_ids = torch.tensor(tokens, dtype=torch.long)
+                attention_mask = (input_ids != getattr(self.tokenizer, 'pad_token_id', 0)).long()
+                
+                # Apply Vedic weighting
+                if is_vedic:
+                    vedic_weights = torch.ones_like(attention_mask, dtype=torch.float) * self.vedic_weight
+                else:
+                    vedic_weights = torch.ones_like(attention_mask, dtype=torch.float)
+                
+                result = {
+                    'input_ids': input_ids,
+                    'attention_mask': attention_mask,
+                    'labels': input_ids.clone(),
+                    'vedic_weights': vedic_weights,
+                    'is_vedic': torch.tensor(1 if is_vedic else 0, dtype=torch.long),
+                }
+                
+                # Add metadata (but skip problematic keys)
+                for key, value in example.items():
+                    if key not in ['text', 'tokens', 'is_vedic', 'is_pretokenized'] and not key.startswith('_'):
+                        try:
+                            if isinstance(value, (str, int, float, bool)):
+                                result[key] = value
+                            elif isinstance(value, list) and all(isinstance(x, (str, int, float, bool)) for x in value):
+                                result[key] = value
+                        except:
+                            continue
+                
+                return result
+            
+            # Handle regular text that needs tokenization
             text = example.get('text', '')
             if not text:
                 return None
             
-            # Check if this is Vedic content
-            is_vedic = example.get('is_vedic', False)
-            
-            # Use Vedic tokenizer if available
+            # Use Vedic tokenizer if available and content is Vedic
             if hasattr(self.tokenizer, 'encode_vedic_text') and is_vedic:
                 token_ids = self.tokenizer.encode_vedic_text(
                     text,
@@ -653,7 +760,7 @@ class StreamingVedicDataset(StreamingINDRADataset):
             
             # Add metadata (but skip problematic keys)
             for key, value in example.items():
-                if key not in ['text', 'is_vedic'] and not key.startswith('_'):
+                if key not in ['text', 'tokens', 'is_vedic', 'is_pretokenized'] and not key.startswith('_'):
                     try:
                         if isinstance(value, (str, int, float, bool)):
                             result[key] = value
