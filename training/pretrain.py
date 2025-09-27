@@ -10,6 +10,8 @@ import time
 import logging
 from typing import Dict, Optional, Any, List
 from pathlib import Path
+import psutil
+import GPUtil
 
 import torch
 import torch.nn as nn
@@ -21,6 +23,17 @@ from .trainer_utils import TrainerUtils, get_optimizer, get_scheduler, MetricsTr
 from data import StreamingINDRADataset, StreamingVedicDataset
 from model import INDRATransformer
 
+def log_system_stats():
+    # CPU and Memory
+    cpu_percent = psutil.cpu_percent()
+    memory = psutil.virtual_memory()
+    
+    # GPU
+    gpus = GPUtil.getGPUs()
+    for gpu in gpus:
+        print(f"GPU {gpu.id}: {gpu.memoryUsed}/{gpu.memoryTotal}MB ({gpu.memoryUtil*100:.1f}%)")
+    
+    print(f"CPU: {cpu_percent}%, RAM: {memory.percent}%, Available: {memory.available/1024**3:.1f}GB")
 
 class PretrainTrainer:
     """Pre-training trainer with Vedic curriculum learning and streaming datasets."""
@@ -311,6 +324,8 @@ class PretrainTrainer:
                 # Logging
                 if self.global_step % self.config.logging_steps == 0:
                     self._log_metrics(loss)
+                    log_system_stats()
+                
                 
                 # Update curriculum phase
                 self._update_curriculum_phase()
@@ -728,3 +743,4 @@ class PretrainTrainer:
         logging.info(f"Resumed from step {self.global_step}")
         
         return checkpoint_info
+
