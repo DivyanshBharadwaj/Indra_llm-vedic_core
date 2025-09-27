@@ -491,6 +491,9 @@ def pretrain_mode(args):
     # Resume from checkpoint if specified
     if args.resume_from_checkpoint:
         trainer.resume_from_checkpoint(args.resume_from_checkpoint)
+
+    if os.path.exists(latest_checkpoint):
+        args.resume_from_checkpoint = latest_checkpoint
     
     # Start training
     results = trainer.train()
@@ -751,6 +754,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
