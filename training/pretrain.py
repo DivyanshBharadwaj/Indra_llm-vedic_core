@@ -313,7 +313,7 @@ class PretrainTrainer:
                 # Logging
                 if self.global_step % self.config.logging_steps == 0:
                     self._log_metrics(loss)
-                    log_system_stats()
+                    self.log_system_stats()
                 
                 
                 # Update curriculum phase
@@ -692,17 +692,17 @@ class PretrainTrainer:
         self._last_log_time = current_time
         self._last_log_step = self.global_step
 
-    def log_system_stats():
-        # CPU and Memory
-        cpu_percent = psutil.cpu_percent()
-        memory = psutil.virtual_memory()
+    # def log_system_stats():
+    #     # CPU and Memory
+    #     cpu_percent = psutil.cpu_percent()
+    #     memory = psutil.virtual_memory()
         
-        # GPU
-        gpus = GPUtil.getGPUs()
-        for gpu in gpus:
-            print(f"GPU {gpu.id}: {gpu.memoryUsed}/{gpu.memoryTotal}MB ({gpu.memoryUtil*100:.1f}%)")
+    #     # GPU
+    #     gpus = GPUtil.getGPUs()
+    #     for gpu in gpus:
+    #         print(f"GPU {gpu.id}: {gpu.memoryUsed}/{gpu.memoryTotal}MB ({gpu.memoryUtil*100:.1f}%)")
         
-        print(f"CPU: {cpu_percent}%, RAM: {memory.percent}%, Available: {memory.available/1024**3:.1f}GB")
+    #     print(f"CPU: {cpu_percent}%, RAM: {memory.percent}%, Available: {memory.available/1024**3:.1f}GB")
     
     def _save_checkpoint(self, final: bool = False):
         """Save model checkpoint."""
@@ -744,5 +744,6 @@ class PretrainTrainer:
         logging.info(f"Resumed from step {self.global_step}")
         
         return checkpoint_info
+
 
 
