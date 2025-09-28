@@ -313,7 +313,7 @@ class PretrainTrainer:
                 # Logging
                 if self.global_step % self.config.logging_steps == 0:
                     self._log_metrics(loss)
-                    self.log_system_stats()
+#                    self.log_system_stats()
                 
                 
                 # Update curriculum phase
@@ -744,6 +744,7 @@ class PretrainTrainer:
         logging.info(f"Resumed from step {self.global_step}")
         
         return checkpoint_info
+
 
 
 
